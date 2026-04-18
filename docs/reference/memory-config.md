@@ -16,6 +16,8 @@ conceptual overviews, see:
 - [Memory Overview](/concepts/memory) -- how memory works
 - [Builtin Engine](/concepts/memory-builtin) -- default SQLite backend
 - [QMD Engine](/concepts/memory-qmd) -- local-first sidecar
+- [Mem0 Backend](/reference/memory-config#mem0-backend-config) -- self-hosted long-term memory service
+- [Hybrid Backend](/reference/memory-config#hybrid-backend-config) -- routed QMD + Mem0 reads/writes
 - [Memory Search](/concepts/memory-search) -- search pipeline and tuning
 
 All memory search settings live under `agents.defaults.memorySearch` in
@@ -330,6 +332,108 @@ Controls which sessions can receive QMD search results. Same schema as
         default: "deny",
         rules: [{ action: "allow", match: { chatType: "direct" } }],
       },
+    },
+  },
+}
+```
+
+---
+
+## Mem0 backend config
+
+Set `memory.backend = "mem0"` to enable. Mem0 settings live under `memory.mem0`:
+
+| Key             | Type      | Default                 | Description                                             |
+| --------------- | --------- | ----------------------- | ------------------------------------------------------- |
+| `enabled`       | `boolean` | `true`                  | Enable Mem0 backend calls                               |
+| `baseUrl`       | `string`  | `http://127.0.0.1:8000` | Mem0 service base URL                                   |
+| `apiKey`        | `string`  | --                      | Optional `Authorization: Token <key>` header            |
+| `userIdPrefix`  | `string`  | `openclaw-user`         | Prefix used to scope Mem0 `user_id` per session         |
+| `agentIdPrefix` | `string`  | `openclaw-agent`        | Prefix used to scope Mem0 `agent_id` per OpenClaw agent |
+| `searchPath`    | `string`  | `/v2/memories/search/`  | Mem0 search endpoint path                               |
+| `addPath`       | `string`  | `/v1/memories/`         | Mem0 add-memory endpoint path                           |
+| `topK`          | `number`  | `8`                     | Default top results for recall                          |
+| `threshold`     | `number`  | `0.2`                   | Minimum score threshold for injected memories           |
+| `timeoutMs`     | `number`  | `8000`                  | Timeout for Mem0 HTTP requests                          |
+
+When Mem0 is active, OpenClaw keeps the same `memory_search` and `memory_get`
+tool names. `before_prompt_build` performs automatic recall from Mem0, and
+`agent_end` writes user facts back to Mem0 asynchronously.
+
+---
+
+## Hybrid backend config
+
+Set `memory.backend = "hybrid"` to route memory reads/writes across QMD and
+Mem0 in one agent.
+
+| Key                          | Type      | Default  | Description                                             |
+| ---------------------------- | --------- | -------- | ------------------------------------------------------- |
+| `hybrid.read.mode`           | `string`  | `routed` | `routed` uses rules; `dual` queries both backends       |
+| `hybrid.read.order[]`        | `string`  | mem0,qmd | Merge priority when dual read is active                 |
+| `hybrid.read.maxResults`     | `number`  | `8`      | Default max merged recall results                       |
+| `hybrid.read.dedupe`         | `boolean` | `true`   | Remove duplicate merged hits                            |
+| `hybrid.write.mode`          | `string`  | `routed` | `routed` or `dual` write behavior                       |
+| `hybrid.write.successPolicy` | `string`  | `any`    | `any` allows partial success; `all` requires all writes |
+| `hybrid.routing[]`           | `array`   | built-in | Ordered route rules with `{ scope, source, ... }`       |
+
+Each route rule supports:
+
+- `scope`: `read` | `write` | `both`
+- `source`: `query` | `conversation` | `knowledge`
+- `priority`: `normal` | `critical`
+- `tags[]` and `queryIncludes[]` for keyword matching
+- `target`: `qmd` | `mem0` | `both`
+
+### Full Hybrid example
+
+```json5
+{
+  memory: {
+    backend: "hybrid",
+    citations: "auto",
+    qmd: {
+      includeDefaultMemory: true,
+    },
+    mem0: {
+      baseUrl: "http://127.0.0.1:8000",
+    },
+    hybrid: {
+      read: { mode: "routed", order: ["mem0", "qmd"], maxResults: 8, dedupe: true },
+      write: { mode: "routed", successPolicy: "any" },
+      routing: [
+        { scope: "write", source: "conversation", priority: "critical", target: "both" },
+        {
+          scope: "write",
+          source: "conversation",
+          tags: ["task", "preference", "mood"],
+          target: "mem0",
+        },
+        {
+          scope: "read",
+          source: "query",
+          queryIncludes: ["architecture", "rag", "course"],
+          target: "qmd",
+        },
+      ],
+    },
+  },
+}
+```
+
+### Full Mem0 example
+
+```json5
+{
+  memory: {
+    backend: "mem0",
+    citations: "auto",
+    mem0: {
+      baseUrl: "http://127.0.0.1:8000",
+      apiKey: "${MEM0_API_KEY}",
+      topK: 8,
+      threshold: 0.2,
+      timeoutMs: 8000,
     },
   },
 }

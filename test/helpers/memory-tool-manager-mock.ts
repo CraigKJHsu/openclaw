@@ -3,7 +3,7 @@ import { vi } from "vitest";
 export type SearchImpl = () => Promise<unknown[]>;
 export type MemoryReadParams = { relPath: string; from?: number; lines?: number };
 export type MemoryReadResult = { text: string; path: string };
-type MemoryBackend = "builtin" | "qmd";
+type MemoryBackend = "builtin" | "qmd" | "mem0" | "hybrid";
 
 let backend: MemoryBackend = "builtin";
 let searchImpl: SearchImpl = async () => [];

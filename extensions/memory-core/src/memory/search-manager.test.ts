@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 type CheckQmdBinaryAvailability = typeof checkQmdBinaryAvailabilityFn;
 
 function createManagerStatus(params: {
-  backend: "qmd" | "builtin";
+  backend: "qmd" | "builtin" | "mem0" | "hybrid";
   provider: string;
   model: string;
   requestedProvider: string;
@@ -33,7 +33,7 @@ function createManagerStatus(params: {
 }
 
 function createManagerMock(params: {
-  backend: "qmd" | "builtin";
+  backend: "qmd" | "builtin" | "mem0" | "hybrid";
   provider: string;
   model: string;
   requestedProvider: string;
@@ -101,6 +101,15 @@ const mockCloseAllMemoryIndexManagers = vi.hoisted(() => vi.fn(async () => {}));
 const checkQmdBinaryAvailability = vi.hoisted(() =>
   vi.fn<CheckQmdBinaryAvailability>(async () => ({ available: true })),
 );
+const mockMem0Manager = vi.hoisted(() => ({
+  ...createManagerMock({
+    backend: "mem0",
+    provider: "mem0",
+    model: "mem0",
+    requestedProvider: "mem0",
+  }),
+}));
+const createMem0ManagerMock = vi.hoisted(() => vi.fn(async () => mockMem0Manager));
 
 vi.mock("./qmd-manager.js", () => ({
   QmdMemoryManager: {
@@ -118,6 +127,11 @@ vi.mock("./manager-runtime.js", () => ({
   },
   closeAllMemoryIndexManagers: mockCloseAllMemoryIndexManagers,
 }));
+vi.mock("./mem0-manager.js", () => ({
+  Mem0MemoryManager: {
+    create: createMem0ManagerMock,
+  },
+}));
 
 import { QmdMemoryManager } from "./qmd-manager.js";
 import { closeAllMemorySearchManagers, getMemorySearchManager } from "./search-manager.js";
@@ -129,6 +143,28 @@ type SearchManager = NonNullable<SearchManagerResult["manager"]>;
 function createQmdCfg(agentId: string): OpenClawConfig {
   return {
     memory: { backend: "qmd", qmd: {} },
+    agents: { list: [{ id: agentId, default: true, workspace: "/tmp/workspace" }] },
+  };
+}
+
+function createMem0Cfg(agentId: string): OpenClawConfig {
+  return {
+    memory: { backend: "mem0", mem0: { baseUrl: "http://127.0.0.1:8000" } },
+    agents: { list: [{ id: agentId, default: true, workspace: "/tmp/workspace" }] },
+  };
+}
+
+function createHybridCfg(agentId: string): OpenClawConfig {
+  return {
+    memory: {
+      backend: "hybrid",
+      mem0: { baseUrl: "http://127.0.0.1:8000" },
+      qmd: {},
+      hybrid: {
+        read: { mode: "routed", order: ["mem0", "qmd"], maxResults: 6, dedupe: true },
+        write: { mode: "routed", successPolicy: "any" },
+      },
+    },
     agents: { list: [{ id: agentId, default: true, workspace: "/tmp/workspace" }] },
   };
 }
@@ -150,29 +186,162 @@ async function createFailedQmdSearchHarness(params: { agentId: string; errorMess
 
 beforeEach(async () => {
   await closeAllMemorySearchManagers();
-  mockPrimary.search.mockClear();
-  mockPrimary.readFile.mockClear();
-  mockPrimary.status.mockClear();
-  mockPrimary.sync.mockClear();
-  mockPrimary.probeEmbeddingAvailability.mockClear();
-  mockPrimary.probeVectorAvailability.mockClear();
-  mockPrimary.close.mockClear();
-  fallbackSearch.mockClear();
-  fallbackManager.readFile.mockClear();
-  fallbackManager.status.mockClear();
-  fallbackManager.sync.mockClear();
-  fallbackManager.probeEmbeddingAvailability.mockClear();
-  fallbackManager.probeVectorAvailability.mockClear();
-  fallbackManager.close.mockClear();
+  mockPrimary.search.mockReset();
+  mockPrimary.readFile.mockReset();
+  mockPrimary.status.mockReset();
+  mockPrimary.sync.mockReset();
+  mockPrimary.probeEmbeddingAvailability.mockReset();
+  mockPrimary.probeVectorAvailability.mockReset();
+  mockPrimary.close.mockReset();
+  fallbackSearch.mockReset();
+  fallbackManager.readFile.mockReset();
+  fallbackManager.status.mockReset();
+  fallbackManager.sync.mockReset();
+  fallbackManager.probeEmbeddingAvailability.mockReset();
+  fallbackManager.probeVectorAvailability.mockReset();
+  fallbackManager.close.mockReset();
+  mockMem0Manager.search.mockReset();
+  mockMem0Manager.readFile.mockReset();
+  mockMem0Manager.status.mockReset();
+  mockMem0Manager.sync.mockReset();
+  mockMem0Manager.probeEmbeddingAvailability.mockReset();
+  mockMem0Manager.probeVectorAvailability.mockReset();
+  mockMem0Manager.close.mockReset();
   mockCloseAllMemoryIndexManagers.mockClear();
   mockMemoryIndexGet.mockClear();
   mockMemoryIndexGet.mockResolvedValue(fallbackManager);
+  fallbackSearch.mockResolvedValue([
+    {
+      path: "MEMORY.md",
+      startLine: 1,
+      endLine: 1,
+      score: 1,
+      snippet: "fallback",
+      source: "memory",
+    },
+  ]);
+  fallbackManager.readFile.mockResolvedValue({ text: "", path: "MEMORY.md" });
+  fallbackManager.status.mockImplementation(() =>
+    createManagerStatus({
+      backend: "builtin",
+      provider: "openai",
+      model: "text-embedding-3-small",
+      requestedProvider: "openai",
+    }),
+  );
+  fallbackManager.sync.mockResolvedValue(undefined);
+  fallbackManager.probeEmbeddingAvailability.mockResolvedValue({ ok: true });
+  fallbackManager.probeVectorAvailability.mockResolvedValue(true);
+  fallbackManager.close.mockResolvedValue(undefined);
+  mockPrimary.search.mockResolvedValue([]);
+  mockPrimary.readFile.mockResolvedValue({ text: "", path: "MEMORY.md" });
+  mockPrimary.status.mockImplementation(() =>
+    createManagerStatus({
+      backend: "qmd",
+      provider: "qmd",
+      model: "qmd",
+      requestedProvider: "qmd",
+      withMemorySourceCounts: true,
+    }),
+  );
+  mockPrimary.sync.mockResolvedValue(undefined);
+  mockPrimary.probeEmbeddingAvailability.mockResolvedValue({ ok: true });
+  mockPrimary.probeVectorAvailability.mockResolvedValue(true);
+  mockPrimary.close.mockResolvedValue(undefined);
+  mockMem0Manager.search.mockResolvedValue([]);
+  mockMem0Manager.readFile.mockResolvedValue({ text: "", path: "mem0/default" });
+  mockMem0Manager.status.mockImplementation(() =>
+    createManagerStatus({
+      backend: "mem0",
+      provider: "mem0",
+      model: "mem0",
+      requestedProvider: "mem0",
+    }),
+  );
+  mockMem0Manager.sync.mockResolvedValue(undefined);
+  mockMem0Manager.probeEmbeddingAvailability.mockResolvedValue({ ok: true });
+  mockMem0Manager.probeVectorAvailability.mockResolvedValue(true);
+  mockMem0Manager.close.mockResolvedValue(undefined);
   checkQmdBinaryAvailability.mockClear();
   checkQmdBinaryAvailability.mockResolvedValue({ available: true });
   createQmdManagerMock.mockClear();
+  createMem0ManagerMock.mockClear();
 });
 
 describe("getMemorySearchManager caching", () => {
+  it("reuses the same Mem0 manager instance for repeated calls", async () => {
+    const cfg = createMem0Cfg("mem0-main");
+    const first = await getMemorySearchManager({ cfg, agentId: "mem0-main" });
+    const second = await getMemorySearchManager({ cfg, agentId: "mem0-main" });
+
+    expect(first.manager).toBe(second.manager);
+    expect(createMem0ManagerMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to builtin manager when Mem0 manager creation fails", async () => {
+    const cfg = createMem0Cfg("mem0-fallback");
+    createMem0ManagerMock.mockRejectedValueOnce(new Error("mem0 offline"));
+
+    const result = await getMemorySearchManager({ cfg, agentId: "mem0-fallback" });
+    const manager = requireManager(result);
+    const searchResults = await manager.search("hello");
+
+    expect(mockMemoryIndexGet).toHaveBeenCalledTimes(1);
+    expect(searchResults).toHaveLength(1);
+  });
+
+  it("creates a hybrid manager and routes hot queries to mem0", async () => {
+    const cfg = createHybridCfg("hybrid-hot");
+    mockMem0Manager.search.mockResolvedValueOnce([
+      {
+        path: "mem0/task",
+        startLine: 1,
+        endLine: 1,
+        score: 0.9,
+        snippet: "目前任務：調整網格參數",
+        source: "memory",
+      },
+    ]);
+    mockPrimary.search.mockResolvedValueOnce([
+      {
+        path: "MEMORY.md",
+        startLine: 1,
+        endLine: 1,
+        score: 0.8,
+        snippet: "OpenClaw 引擎架構",
+        source: "memory",
+      },
+    ]);
+
+    const result = await getMemorySearchManager({ cfg, agentId: "hybrid-hot" });
+    const manager = requireManager(result);
+    const searchResults = await manager.search("我的任務待辦是什麼？");
+
+    expect(searchResults[0]?.path).toBe("mem0/task");
+    expect(mockMem0Manager.search).toHaveBeenCalled();
+  });
+
+  it("routes architecture queries to qmd in hybrid mode", async () => {
+    const cfg = createHybridCfg("hybrid-cold");
+    mockPrimary.search.mockResolvedValueOnce([
+      {
+        path: "memory/architecture.md",
+        startLine: 1,
+        endLine: 1,
+        score: 0.86,
+        snippet: "OpenClaw engine architecture",
+        source: "memory",
+      },
+    ]);
+
+    const result = await getMemorySearchManager({ cfg, agentId: "hybrid-cold" });
+    const manager = requireManager(result);
+    const searchResults = await manager.search("請說明 OpenClaw engine architecture");
+
+    expect(searchResults[0]?.path).toBe("memory/architecture.md");
+    expect(mockPrimary.search).toHaveBeenCalled();
+  });
+
   it("reuses the same QMD manager instance for repeated calls", async () => {
     const cfg = createQmdCfg("main");
 

@@ -1019,6 +1019,7 @@
                   "concepts/architecture",
                   "concepts/agent",
                   "concepts/agent-loop",
+                  "UMLs/chat-inbound-reply-sequence",
                   "concepts/system-prompt",
                   "concepts/context",
                   "concepts/context-engine",

@@ -42,6 +42,15 @@ export type MemoryRuntimeQmdConfig = {
   command?: string;
 };
 
+export type MemoryRuntimeMem0Config = {
+  baseUrl: string;
+  searchPath: string;
+  addPath: string;
+  topK: number;
+  threshold: number;
+  timeoutMs: number;
+};
+
 export type MemoryRuntimeBackendConfig =
   | {
       backend: "builtin";
@@ -49,6 +58,20 @@ export type MemoryRuntimeBackendConfig =
   | {
       backend: "qmd";
       qmd?: MemoryRuntimeQmdConfig;
+    }
+  | {
+      backend: "mem0";
+      mem0: MemoryRuntimeMem0Config;
+    }
+  | {
+      backend: "hybrid";
+      mem0: MemoryRuntimeMem0Config;
+      qmd?: MemoryRuntimeQmdConfig;
+      hybrid?: {
+        readMode: "dual" | "routed";
+        writeMode: "dual" | "routed";
+        successPolicy: "any" | "all";
+      };
     };
 
 export type MemoryPluginRuntime = {

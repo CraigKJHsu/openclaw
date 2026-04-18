@@ -23,6 +23,13 @@ function createQmdConfig(agents: OpenClawConfig["agents"]): OpenClawConfig {
   } as OpenClawConfig;
 }
 
+function createHybridConfig(agents: OpenClawConfig["agents"]): OpenClawConfig {
+  return {
+    agents,
+    memory: { backend: "hybrid", qmd: {}, mem0: { baseUrl: "http://127.0.0.1:8000" } },
+  } as OpenClawConfig;
+}
+
 function createGatewayLogMock() {
   return { info: vi.fn(), warn: vi.fn() };
 }
@@ -32,8 +39,11 @@ describe("startGatewayMemoryBackend", () => {
     getMemorySearchManagerMock.mockClear();
     resolveActiveMemoryBackendConfigMock.mockReset();
     resolveActiveMemoryBackendConfigMock.mockImplementation(({ cfg }: { cfg: OpenClawConfig }) => ({
-      backend: cfg.memory?.backend === "qmd" ? "qmd" : "builtin",
-      qmd: cfg.memory?.backend === "qmd" ? {} : undefined,
+      backend:
+        cfg.memory?.backend === "qmd" || cfg.memory?.backend === "hybrid"
+          ? cfg.memory.backend
+          : "builtin",
+      qmd: cfg.memory?.backend === "qmd" || cfg.memory?.backend === "hybrid" ? {} : undefined,
     }));
   });
 
@@ -63,11 +73,11 @@ describe("startGatewayMemoryBackend", () => {
     expect(getMemorySearchManagerMock).toHaveBeenNthCalledWith(2, { cfg, agentId: "main" });
     expect(log.info).toHaveBeenNthCalledWith(
       1,
-      'qmd memory startup initialization armed for agent "ops"',
+      'memory startup initialization armed for agent "ops"',
     );
     expect(log.info).toHaveBeenNthCalledWith(
       2,
-      'qmd memory startup initialization armed for agent "main"',
+      'memory startup initialization armed for agent "main"',
     );
     expect(log.warn).not.toHaveBeenCalled();
   });
@@ -82,11 +92,9 @@ describe("startGatewayMemoryBackend", () => {
     await startGatewayMemoryBackend({ cfg, log });
 
     expect(log.warn).toHaveBeenCalledWith(
-      'qmd memory startup initialization failed for agent "main": qmd missing',
+      'memory startup initialization failed for agent "main": qmd missing',
     );
-    expect(log.info).toHaveBeenCalledWith(
-      'qmd memory startup initialization armed for agent "ops"',
-    );
+    expect(log.info).toHaveBeenCalledWith('memory startup initialization armed for agent "ops"');
   });
 
   it("skips agents with memory search disabled", async () => {
@@ -104,9 +112,18 @@ describe("startGatewayMemoryBackend", () => {
 
     expect(getMemorySearchManagerMock).toHaveBeenCalledTimes(1);
     expect(getMemorySearchManagerMock).toHaveBeenCalledWith({ cfg, agentId: "main" });
-    expect(log.info).toHaveBeenCalledWith(
-      'qmd memory startup initialization armed for agent "main"',
-    );
+    expect(log.info).toHaveBeenCalledWith('memory startup initialization armed for agent "main"');
     expect(log.warn).not.toHaveBeenCalled();
+  });
+
+  it("initializes qmd arm when backend is hybrid", async () => {
+    const cfg = createHybridConfig({ list: [{ id: "main", default: true }] });
+    const log = createGatewayLogMock();
+    getMemorySearchManagerMock.mockResolvedValue({ manager: { search: vi.fn() } });
+
+    await startGatewayMemoryBackend({ cfg, log });
+
+    expect(getMemorySearchManagerMock).toHaveBeenCalledWith({ cfg, agentId: "main" });
+    expect(log.info).toHaveBeenCalledWith('memory startup initialization armed for agent "main"');
   });
 });

@@ -58,7 +58,7 @@ export function createMemorySearchTool(options: {
           const decorated = decorateCitations(rawResults, includeCitations);
           const resolved = resolveMemoryBackendConfig({ cfg, agentId });
           const results =
-            status.backend === "qmd"
+            status.backend === "qmd" || status.backend === "hybrid"
               ? clampResultsByInjectedChars(decorated, resolved.qmd?.limits.maxInjectedChars)
               : decorated;
           const searchMode = (status.custom as { searchMode?: string } | undefined)?.searchMode;

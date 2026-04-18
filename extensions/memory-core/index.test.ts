@@ -1,6 +1,6 @@
 import { Command } from "commander";
 import type { OpenClawConfig } from "openclaw/plugin-sdk/memory-core";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import plugin, {
   buildMemoryFlushPlan,
   buildPromptSection,
@@ -8,7 +8,13 @@ import plugin, {
   DEFAULT_MEMORY_FLUSH_PROMPT,
   DEFAULT_MEMORY_FLUSH_SOFT_TOKENS,
 } from "./index.js";
+import * as memoryIndex from "./src/memory/index.js";
+import { Mem0MemoryManager } from "./src/memory/mem0-manager.js";
 import { memoryRuntime } from "./src/runtime-provider.js";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("buildPromptSection", () => {
   it("returns empty when no memory tools are available", () => {
@@ -178,5 +184,153 @@ describe("buildMemoryFlushPlan", () => {
     expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain("do not overwrite");
     expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain("timestamped variant");
     expect(DEFAULT_MEMORY_FLUSH_PROMPT).toContain("YYYY-MM-DD.md");
+  });
+});
+
+describe("Mem0 lifecycle hooks", () => {
+  it("injects prepend context via before_prompt_build for mem0 backend", async () => {
+    const hooks = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    const mockManager = {
+      search: vi.fn(async () => [
+        {
+          path: "mem0/abc",
+          startLine: 1,
+          endLine: 1,
+          score: 0.91,
+          snippet: "使用者偏好在晚上 9 點後通知。",
+          source: "memory" as const,
+        },
+      ]),
+      captureConversation: vi.fn(async () => {}),
+    };
+    Object.setPrototypeOf(mockManager, Mem0MemoryManager.prototype);
+    const getManagerSpy = vi
+      .spyOn(memoryIndex, "getMemorySearchManager")
+      .mockResolvedValue({ manager: mockManager as unknown as Mem0MemoryManager });
+    const api = {
+      config: {
+        memory: { backend: "mem0", mem0: { baseUrl: "http://127.0.0.1:8000" } },
+      } as OpenClawConfig,
+      registerMemoryPromptSection: vi.fn(),
+      registerMemoryFlushPlan: vi.fn(),
+      registerMemoryRuntime: vi.fn(),
+      registerTool: vi.fn(),
+      registerCli: vi.fn(),
+      registerMemoryEmbeddingProvider: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+        hooks.set(name, handler);
+      }),
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    } as unknown as Parameters<NonNullable<typeof plugin.register>>[0];
+
+    plugin.register?.(api);
+    const handler = hooks.get("before_prompt_build");
+    expect(handler).toBeDefined();
+    const result = await handler?.(
+      { prompt: "我什麼時候喜歡收到提醒？", messages: [] },
+      { agentId: "main", sessionKey: "telegram:direct:u1" },
+    );
+
+    expect(getManagerSpy).toHaveBeenCalled();
+    expect(result).toEqual(
+      expect.objectContaining({
+        prependContext: expect.stringContaining("Relevant long-term memories from Mem0"),
+      }),
+    );
+  });
+
+  it("captures user messages on agent_end for mem0 backend", async () => {
+    const hooks = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    const mockManager = {
+      search: vi.fn(async () => []),
+      captureConversation: vi.fn(async () => {}),
+    };
+    Object.setPrototypeOf(mockManager, Mem0MemoryManager.prototype);
+    const getManagerSpy = vi
+      .spyOn(memoryIndex, "getMemorySearchManager")
+      .mockResolvedValue({ manager: mockManager as unknown as Mem0MemoryManager });
+    const api = {
+      config: {
+        memory: { backend: "mem0", mem0: { baseUrl: "http://127.0.0.1:8000" } },
+      } as OpenClawConfig,
+      registerMemoryPromptSection: vi.fn(),
+      registerMemoryFlushPlan: vi.fn(),
+      registerMemoryRuntime: vi.fn(),
+      registerTool: vi.fn(),
+      registerCli: vi.fn(),
+      registerMemoryEmbeddingProvider: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+        hooks.set(name, handler);
+      }),
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    } as unknown as Parameters<NonNullable<typeof plugin.register>>[0];
+
+    plugin.register?.(api);
+    const handler = hooks.get("agent_end");
+    expect(handler).toBeDefined();
+    await handler?.(
+      {
+        success: true,
+        messages: [{ role: "user", content: "我偏好每週報表。" }],
+      },
+      { agentId: "main", sessionKey: "telegram:direct:u1" },
+    );
+
+    expect(getManagerSpy).toHaveBeenCalled();
+    expect(mockManager.captureConversation).toHaveBeenCalledWith({
+      sessionKey: "telegram:direct:u1",
+      messages: [{ role: "user", content: "我偏好每週報表。" }],
+    });
+  });
+
+  it("captures user messages on agent_end for hybrid backend", async () => {
+    const hooks = new Map<string, (event: unknown, ctx: unknown) => Promise<unknown>>();
+    const mockManager = {
+      search: vi.fn(async () => []),
+      captureConversation: vi.fn(async () => {}),
+    };
+    const getManagerSpy = vi
+      .spyOn(memoryIndex, "getMemorySearchManager")
+      .mockResolvedValue({ manager: mockManager as unknown as Mem0MemoryManager });
+    const api = {
+      config: {
+        memory: {
+          backend: "hybrid",
+          mem0: { baseUrl: "http://127.0.0.1:8000" },
+          qmd: {},
+          hybrid: {
+            read: { mode: "routed", order: ["mem0", "qmd"] },
+            write: { mode: "routed", successPolicy: "any" },
+          },
+        },
+      } as OpenClawConfig,
+      registerMemoryPromptSection: vi.fn(),
+      registerMemoryFlushPlan: vi.fn(),
+      registerMemoryRuntime: vi.fn(),
+      registerTool: vi.fn(),
+      registerCli: vi.fn(),
+      registerMemoryEmbeddingProvider: vi.fn(),
+      on: vi.fn((name: string, handler: (event: unknown, ctx: unknown) => Promise<unknown>) => {
+        hooks.set(name, handler);
+      }),
+      logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+    } as unknown as Parameters<NonNullable<typeof plugin.register>>[0];
+
+    plugin.register?.(api);
+    const handler = hooks.get("agent_end");
+    expect(handler).toBeDefined();
+    await handler?.(
+      {
+        success: true,
+        messages: [{ role: "user", content: "目前交易心態偏保守。" }],
+      },
+      { agentId: "main", sessionKey: "telegram:direct:u1" },
+    );
+
+    expect(getManagerSpy).toHaveBeenCalled();
+    expect(mockManager.captureConversation).toHaveBeenCalledWith({
+      sessionKey: "telegram:direct:u1",
+      messages: [{ role: "user", content: "目前交易心態偏保守。" }],
+    });
   });
 });
