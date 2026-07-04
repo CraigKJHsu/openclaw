@@ -60,6 +60,18 @@ Hermes may request only task template IDs, not arbitrary OpenClaw tool names. Op
 
 The v1 bridge has no real external side effects. Tests and the demo use dry-run mocks only. In `hermesMode: "real"`, non-dry-run requests for mock-only templates fail closed with `real_task_unavailable` instead of silently falling back to mock execution.
 
+As of the 2026-07-04 Hermes/ClawOps routing update, real external browser work such as Facebook listing continuation is not a Hermes bridge responsibility. That work is routed through the Hermes-owned ClawOps Kanban path:
+
+```text
+/clawops <objective>
+  -> HubOps routing-rules.yaml
+  -> agent-registry.yaml
+  -> logical worker: clawops.browser
+  -> runtime_profile / Kanban assignee: clawops-browser
+```
+
+The bridge remains the `/openclaw-dry-run` path for mock contracts, health/status tasks, and future allowlisted OpenClaw task templates. It must not be treated as evidence that OpenClaw can perform real Facebook/browser side effects.
+
 ## Request Schema
 
 ```json
@@ -232,6 +244,7 @@ COREPACK_HOME=/private/tmp/corepack corepack pnpm test test/scripts/check-hermes
 
 - V1 has the real Hermes repo present and verified, but live non-dry-run task execution remains fail-closed until a documented Hermes-side runtime adapter is implemented.
 - V1 does not perform real Telegram sends or other external side effects.
+- V1 does not perform real Facebook/browser publishing. The current executable browser path is Hermes ClawOps `clawops-browser`, not this bridge.
 - Idempotency is process-local for the plugin route and mock bridge. Persisted deduplication can be added if Hermes starts scheduling long-running tasks.
 - The changed gate cannot complete in the current dirty worktree until unrelated missing files such as `CHANGELOG.md` are restored or excluded; targeted bridge validation, extension typecheck/lint, install, and build pass.
 
