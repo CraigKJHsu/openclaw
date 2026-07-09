@@ -28,6 +28,7 @@ import {
   splitShellArgs,
 } from "./config-utils.js";
 import { isPathInside } from "./fs-utils.js";
+import { resolveMemorySecretInputString } from "./secret-input.js";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeStringEntries,
@@ -212,6 +213,7 @@ function joinUrlPath(basePath: string, fallbackPath: string): string {
 }
 
 function resolveMem0Config(raw: MemoryMem0Config | undefined): ResolvedMem0Config {
+  const enabled = raw?.enabled !== false;
   const baseUrl = raw?.baseUrl?.trim() || "http://127.0.0.1:8000";
   const parsedBaseUrl = new URL(baseUrl);
   const normalizedBaseUrl = parsedBaseUrl.toString().replace(/\/+$/, "");
@@ -228,9 +230,14 @@ function resolveMem0Config(raw: MemoryMem0Config | undefined): ResolvedMem0Confi
       ? Math.floor(raw.timeoutMs)
       : DEFAULT_MEM0_TIMEOUT_MS;
   return {
-    enabled: raw?.enabled !== false,
+    enabled,
     baseUrl: normalizedBaseUrl,
-    apiKey: typeof raw?.apiKey === "string" ? raw.apiKey.trim() || undefined : undefined,
+    apiKey: enabled
+      ? resolveMemorySecretInputString({
+          value: raw?.apiKey,
+          path: "memory.mem0.apiKey",
+        })
+      : undefined,
     userIdPrefix: raw?.userIdPrefix?.trim() || "openclaw-user",
     agentIdPrefix: raw?.agentIdPrefix?.trim() || "openclaw-agent",
     searchPath: joinUrlPath(raw?.searchPath ?? "", DEFAULT_MEM0_SEARCH_PATH),

@@ -577,6 +577,11 @@ export async function listDevicePairing(baseDir?: string): Promise<DevicePairing
   return { pending, paired };
 }
 
+/** Compatibility entrypoint for gateway callers that may add caching later. */
+export async function listDevicePairingCached(baseDir?: string): Promise<DevicePairingList> {
+  return listDevicePairing(baseDir);
+}
+
 /** Return one paired device by normalized device id. */
 export async function getPairedDevice(
   deviceId: string,

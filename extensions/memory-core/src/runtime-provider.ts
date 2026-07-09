@@ -10,30 +10,33 @@ import {
 function toRuntimeBackendConfig(
   resolved: ReturnType<typeof resolveMemoryBackendConfig>,
 ): ReturnType<MemoryPluginRuntime["resolveMemoryBackendConfig"]> {
-  if (resolved.backend === "mem0" && resolved.mem0) {
+  const activeMem0 = resolved.mem0?.enabled ? resolved.mem0 : undefined;
+  if (resolved.backend === "mem0" && activeMem0) {
     return {
       backend: "mem0",
       mem0: {
-        baseUrl: resolved.mem0.baseUrl,
-        searchPath: resolved.mem0.searchPath,
-        addPath: resolved.mem0.addPath,
-        topK: resolved.mem0.topK,
-        threshold: resolved.mem0.threshold,
-        timeoutMs: resolved.mem0.timeoutMs,
+        baseUrl: activeMem0.baseUrl,
+        searchPath: activeMem0.searchPath,
+        addPath: activeMem0.addPath,
+        topK: activeMem0.topK,
+        threshold: activeMem0.threshold,
+        timeoutMs: activeMem0.timeoutMs,
       },
     };
   }
-  if (resolved.backend === "hybrid" && resolved.mem0) {
+  if (resolved.backend === "hybrid") {
     return {
       backend: "hybrid",
-      mem0: {
-        baseUrl: resolved.mem0.baseUrl,
-        searchPath: resolved.mem0.searchPath,
-        addPath: resolved.mem0.addPath,
-        topK: resolved.mem0.topK,
-        threshold: resolved.mem0.threshold,
-        timeoutMs: resolved.mem0.timeoutMs,
-      },
+      mem0: activeMem0
+        ? {
+            baseUrl: activeMem0.baseUrl,
+            searchPath: activeMem0.searchPath,
+            addPath: activeMem0.addPath,
+            topK: activeMem0.topK,
+            threshold: activeMem0.threshold,
+            timeoutMs: activeMem0.timeoutMs,
+          }
+        : undefined,
       qmd: resolved.qmd ? { command: resolved.qmd.command } : undefined,
       hybrid: resolved.hybrid
         ? {

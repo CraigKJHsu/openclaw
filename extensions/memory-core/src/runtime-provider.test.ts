@@ -41,4 +41,29 @@ describe("memoryRuntime", () => {
       agentId: "main",
     });
   });
+
+  it("omits disabled mem0 from hybrid runtime backend config", () => {
+    const cfg = {
+      agents: { defaults: { workspace: "/tmp/memory-runtime-test" } },
+      memory: {
+        backend: "hybrid",
+        mem0: {
+          enabled: false,
+          baseUrl: "http://127.0.0.1:8000",
+        },
+        qmd: {},
+      },
+    } as OpenClawConfig;
+
+    const result = memoryRuntime.resolveMemoryBackendConfig({
+      cfg,
+      agentId: "main",
+    });
+
+    expect(result).toMatchObject({
+      backend: "hybrid",
+      qmd: { command: "qmd" },
+    });
+    expect(result.mem0).toBeUndefined();
+  });
 });

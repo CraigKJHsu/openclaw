@@ -126,6 +126,93 @@ describe("resolveMemoryBackendConfig", () => {
     });
   });
 
+  it("resolves mem0 api key from an env SecretRef", () => {
+    vi.stubEnv("OPENCLAW_MEM0_API_KEY", "mem0-test-key");
+    try {
+      const cfg = {
+        agents: { defaults: { workspace: "/tmp/memory-test" } },
+        memory: {
+          backend: "mem0",
+          mem0: {
+            baseUrl: "http://127.0.0.1:8000",
+            apiKey: { source: "env", provider: "default", id: "OPENCLAW_MEM0_API_KEY" },
+          },
+        },
+      } as OpenClawConfig;
+      const resolved = resolveMemoryBackendConfig({ cfg, agentId: "main" });
+      expect(resolved.mem0?.apiKey).toBe("mem0-test-key");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("resolves mem0 api key from an env template SecretRef", () => {
+    vi.stubEnv("OPENCLAW_MEM0_API_KEY", "mem0-template-key");
+    try {
+      const cfg = {
+        agents: { defaults: { workspace: "/tmp/memory-test" } },
+        memory: {
+          backend: "mem0",
+          mem0: {
+            baseUrl: "http://127.0.0.1:8000",
+            apiKey: "${OPENCLAW_MEM0_API_KEY}",
+          },
+        },
+      } as OpenClawConfig;
+      const resolved = resolveMemoryBackendConfig({ cfg, agentId: "main" });
+      expect(resolved.mem0?.apiKey).toBe("mem0-template-key");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("fails clearly when mem0 env SecretRef is unresolved", () => {
+    vi.stubEnv("OPENCLAW_MEM0_API_KEY", "");
+    try {
+      const cfg = {
+        agents: { defaults: { workspace: "/tmp/memory-test" } },
+        memory: {
+          backend: "mem0",
+          mem0: {
+            baseUrl: "http://127.0.0.1:8000",
+            apiKey: { source: "env", provider: "default", id: "OPENCLAW_MEM0_API_KEY" },
+          },
+        },
+      } as OpenClawConfig;
+      expect(() => resolveMemoryBackendConfig({ cfg, agentId: "main" })).toThrow(
+        /memory\.mem0\.apiKey: unresolved SecretRef/,
+      );
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
+  it("does not resolve mem0 secrets when mem0 is disabled", () => {
+    vi.stubEnv("OPENCLAW_MEM0_API_KEY", "");
+    try {
+      const cfg = {
+        agents: { defaults: { workspace: "/tmp/memory-test" } },
+        memory: {
+          backend: "hybrid",
+          mem0: {
+            enabled: false,
+            baseUrl: "http://127.0.0.1:8000",
+            apiKey: { source: "env", provider: "default", id: "OPENCLAW_MEM0_API_KEY" },
+          },
+          qmd: {},
+        },
+      } as OpenClawConfig;
+      const resolved = resolveMemoryBackendConfig({ cfg, agentId: "main" });
+      expect(resolved.mem0).toMatchObject({
+        enabled: false,
+        baseUrl: "http://127.0.0.1:8000",
+      });
+      expect(resolved.mem0?.apiKey).toBeUndefined();
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("resolves hybrid backend with routed defaults", () => {
     const cfg = {
       agents: { defaults: { workspace: "/tmp/memory-test" } },
