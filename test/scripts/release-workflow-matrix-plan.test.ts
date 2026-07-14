@@ -140,6 +140,33 @@ describe("scripts/plan-release-workflow-matrix.mjs", () => {
     ]);
   });
 
+  it("omits credentialed release chunks when live suites are disabled", () => {
+    const plan = createReleaseWorkflowMatrixPlan({
+      includeLiveSuites: false,
+      includeReleasePathSuites: true,
+      releaseProfile: "stable",
+    });
+
+    expect(plan.dockerE2e.matrix.include.map((entry) => entry.chunk_id)).toEqual([
+      "core",
+      "package-update-core",
+      "plugins-runtime-plugins",
+      "plugins-runtime-install-a",
+      "plugins-runtime-install-b",
+      "plugins-runtime-install-c",
+      "plugins-runtime-install-d",
+      "plugins-runtime-install-e",
+      "plugins-runtime-install-f",
+      "plugins-runtime-install-g",
+      "plugins-runtime-install-h",
+    ]);
+    expect(
+      plan.dockerE2e.omitted
+        .filter((entry) => entry.reason === "requires live provider credentials")
+        .map((entry) => entry.id),
+    ).toEqual(["package-update-openai", "package-update-anthropic", "plugins-runtime-services"]);
+  });
+
   it("limits MiniMax Docker live-model coverage to the stable M2.7 pair", () => {
     const plan = createReleaseWorkflowMatrixPlan({
       includeLiveSuites: true,

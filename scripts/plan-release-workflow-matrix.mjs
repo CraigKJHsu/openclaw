@@ -11,12 +11,14 @@ const DOCKER_E2E_CHUNKS = [
     label: "package/update OpenAI install",
     timeout_minutes: 45,
     profiles: "beta minimum stable full",
+    requires_live_credentials: true,
   },
   {
     chunk_id: "package-update-anthropic",
     label: "package/update Anthropic install",
     timeout_minutes: 60,
     profiles: "beta minimum stable full",
+    requires_live_credentials: true,
   },
   {
     chunk_id: "package-update-core",
@@ -35,6 +37,7 @@ const DOCKER_E2E_CHUNKS = [
     label: "plugins/runtime services",
     timeout_minutes: 60,
     profiles: "stable full",
+    requires_live_credentials: true,
   },
   {
     chunk_id: "plugins-runtime-install-a",
@@ -170,6 +173,33 @@ function planProfileMatrix(entries, profile, enabled, disabledReason, labelForEn
   };
 }
 
+function planDockerE2eMatrix(entries, profile, enabled, includeLiveSuites) {
+  const selected = enabled
+    ? entries.filter(
+        (entry) =>
+          profileIncludes(entry, profile) &&
+          (includeLiveSuites || entry.requires_live_credentials !== true),
+      )
+    : [];
+  const omitted = entries
+    .filter((entry) => !selected.includes(entry))
+    .map((entry) => ({
+      id: entry.chunk_id,
+      label: entry.label,
+      reason: !enabled
+        ? "release-path Docker E2E chunks disabled by input selection"
+        : !profileIncludes(entry, profile)
+          ? `requires one of: ${entry.profiles}`
+          : "requires live provider credentials",
+    }));
+
+  return {
+    count: selected.length,
+    matrix: { include: selected },
+    omitted,
+  };
+}
+
 /**
  * Creates the Docker E2E/live model matrix plan for a release profile.
  */
@@ -183,12 +213,11 @@ export function createReleaseWorkflowMatrixPlan(options = {}) {
     (isBlank(options.liveSuiteFilter) || options.liveSuiteFilter === "docker-live-models");
 
   return {
-    dockerE2e: planProfileMatrix(
+    dockerE2e: planDockerE2eMatrix(
       DOCKER_E2E_CHUNKS,
       releaseProfile,
       dockerE2eEnabled,
-      "release-path Docker E2E chunks disabled by input selection",
-      (entry) => entry.chunk_id,
+      isEnabled(options.includeLiveSuites),
     ),
     liveModels: planProfileMatrix(
       LIVE_MODEL_PROVIDERS,
