@@ -113,6 +113,14 @@ function expectTextToIncludeAll(text: string | undefined, snippets: string[]): v
 }
 
 describe("package acceptance workflow", () => {
+  it("keeps scheduled checks on credential-free E2E lanes", () => {
+    const scheduledWorkflow = readFileSync(SCHEDULED_LIVE_CHECKS_WORKFLOW, "utf8");
+
+    expect(scheduledWorkflow).toContain("include_repo_e2e: true");
+    expect(scheduledWorkflow).toContain("include_release_path_suites: true");
+    expect(scheduledWorkflow).toContain("include_live_suites: false");
+  });
+
   it("verifies immutable postpublish evidence before stable closeout reads it", () => {
     const workflow = readFileSync(STABLE_MAIN_CLOSEOUT_WORKFLOW, "utf8");
     const checksumIndex = workflow.indexOf(

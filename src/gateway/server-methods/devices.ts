@@ -15,7 +15,7 @@ import {
   formatDevicePairingForbiddenMessage,
   getPairedDevice,
   getPendingDevicePairing,
-  listDevicePairingCached,
+  listDevicePairing,
   removePairedDevice,
   type DeviceAuthToken,
   type RevokeDeviceTokenDenyReason,
@@ -218,7 +218,7 @@ export const deviceHandlers: GatewayRequestHandlers = {
     }
     const startedAtMs = Date.now();
     const listStartedAtMs = Date.now();
-    const list = await listDevicePairingCached();
+    const list = await listDevicePairing();
     const listMs = Date.now() - listStartedAtMs;
     const authz = resolveDeviceSessionAuthz(client);
     const filterStartedAtMs = Date.now();
