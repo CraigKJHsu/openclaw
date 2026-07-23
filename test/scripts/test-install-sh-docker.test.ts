@@ -1,13 +1,6 @@
 // Test Install Sh Docker tests cover test install sh docker script behavior.
 import { spawn, spawnSync } from "node:child_process";
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  readFileSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path, { join } from "node:path";
 import { runInNewContext } from "node:vm";
@@ -1155,7 +1148,9 @@ describe("bun global install smoke", () => {
     expect(workflow).toContain("Run Rocky Linux installer smoke");
     expect(workflow).toContain("Run Rocky Linux CLI installer smoke");
     expect(workflow).toContain("scripts/install-cli.sh:/tmp/install-cli.sh:ro");
-    expect(workflow).toContain("bash /tmp/install-cli.sh --prefix /tmp/openclaw-cli");
+    expect(workflow).toContain(
+      "bash /tmp/install-cli.sh --prefix /tmp/openclaw-cli --version latest --no-onboard",
+    );
     expect(workflow).toContain("rockylinux:9@sha256:");
     expect(workflow).toContain("pnpm-workspace.yaml");
     expect(workflow).toContain("workspace.patchedDependencies");
