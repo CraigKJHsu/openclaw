@@ -29,6 +29,26 @@ ensure_home_env() {
 
 ensure_home_env
 
+default_node_version() {
+  local os_name
+  local os_version
+  local os_major
+  local os_minor
+
+  os_name="$(uname -s 2>/dev/null || true)"
+  if [[ "$os_name" == "Darwin" ]] && command -v sw_vers >/dev/null 2>&1; then
+    os_version="$(sw_vers -productVersion 2>/dev/null || true)"
+    IFS=. read -r os_major os_minor _ <<<"$os_version"
+    if [[ "$os_major" =~ ^[0-9]+$ && "$os_minor" =~ ^[0-9]+$ ]] &&
+      ((os_major < 13 || (os_major == 13 && os_minor < 5))); then
+      echo "22.23.1"
+      return
+    fi
+  fi
+
+  echo "24.18.0"
+}
+
 resolve_openclaw_effective_home() {
   local openclaw_home="${OPENCLAW_HOME:-}"
   if [[ -z "$openclaw_home" ]]; then
@@ -52,7 +72,8 @@ resolve_openclaw_effective_home() {
 OPENCLAW_EFFECTIVE_HOME="$(resolve_openclaw_effective_home)"
 PREFIX="${OPENCLAW_PREFIX:-${HOME}/.openclaw}"
 OPENCLAW_VERSION="${OPENCLAW_VERSION:-latest}"
-NODE_VERSION="${OPENCLAW_NODE_VERSION:-22.22.0}"
+DEFAULT_NODE_VERSION="$(default_node_version)"
+NODE_VERSION="${OPENCLAW_NODE_VERSION:-${DEFAULT_NODE_VERSION}}"
 NODE_VERSION_REQUESTED=0
 if [[ -n "${OPENCLAW_NODE_VERSION:-}" ]]; then
   NODE_VERSION_REQUESTED=1
@@ -78,7 +99,7 @@ Usage: install-cli.sh [options]
   --git, --github                     Shortcut for --install-method git
   --git-dir, --dir <path>             Checkout directory (default: ~/openclaw, or \$OPENCLAW_HOME/openclaw)
   --version <ver>                     OpenClaw version (default: latest)
-  --node-version <ver>                Node version (default: 22.22.0)
+  --node-version <ver>                Node version (default: 24.18.0; 22.23.1 on macOS <13.5)
   --onboard                           Run "openclaw onboard" after install
   --no-onboard                        Skip onboarding (default)
   --set-npm-prefix                    Force npm prefix to ~/.npm-global if current prefix is not writable (Linux)
@@ -817,7 +838,7 @@ install_node() {
     local required_version
     installed_version="$("$(node_bin)" -v 2>/dev/null || echo unknown)"
     required_version="$(required_node_version)"
-    fail "Installed Node ${NODE_VERSION} must provide Node >= ${required_version} with node:sqlite; found ${installed_version}. Re-run with --node-version 22.22.0 (or newer)"
+    fail "Installed Node ${NODE_VERSION} must provide Node >= ${required_version} with node:sqlite; found ${installed_version}. Re-run with --node-version ${DEFAULT_NODE_VERSION} (or newer)"
   fi
   emit_json "{\"event\":\"step\",\"name\":\"node\",\"status\":\"ok\",\"version\":\"${NODE_VERSION}\"}"
 }

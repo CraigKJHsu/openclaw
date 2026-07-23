@@ -38,8 +38,58 @@ function linkRequiredShellTools(bin: string) {
   }
 }
 
+function readDefaultNodeVersionForPlatform(osName: string, osVersion?: string) {
+  const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-platform-"));
+  const bin = join(tmp, "bin");
+  mkdirSync(bin);
+  writeFileSync(join(bin, "uname"), `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(osName)}\n`);
+  chmodSync(join(bin, "uname"), 0o755);
+  if (osVersion) {
+    writeFileSync(join(bin, "sw_vers"), `#!/bin/sh\nprintf '%s\\n' ${JSON.stringify(osVersion)}\n`);
+    chmodSync(join(bin, "sw_vers"), 0o755);
+  }
+
+  try {
+    return runInstallCliShell(
+      `
+        set -euo pipefail
+        source "${SCRIPT_PATH}"
+        printf '%s\n' "$NODE_VERSION"
+      `,
+      {
+        OPENCLAW_NODE_VERSION: undefined,
+        PATH: `${bin}:${process.env.PATH}`,
+      },
+    );
+  } finally {
+    rmSync(tmp, { force: true, recursive: true });
+  }
+}
+
 describe("install-cli.sh", () => {
   const script = readFileSync(SCRIPT_PATH, "utf8");
+
+  it("defaults to the patched Node 24 LTS release", () => {
+    const result = readDefaultNodeVersionForPlatform("Linux");
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("24.18.0");
+    expect(script).toContain("Node version (default: 24.18.0; 22.23.1 on macOS <13.5)");
+  });
+
+  it("uses the patched Node 22 line on macOS versions unsupported by Node 24", () => {
+    const result = readDefaultNodeVersionForPlatform("Darwin", "13.4.1");
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("22.23.1");
+  });
+
+  it("uses Node 24 on macOS 13.5 and newer", () => {
+    const result = readDefaultNodeVersionForPlatform("Darwin", "13.5");
+
+    expect(result.status).toBe(0);
+    expect(result.stdout.trim()).toBe("24.18.0");
+  });
 
   it("rejects installer options with missing values", () => {
     const result = runInstallCliShell(`
@@ -166,10 +216,7 @@ describe("install-cli.sh", () => {
     mkdirSync(bin, { recursive: true });
     mkdirSync(outer, { recursive: true });
     mkdirSync(repo, { recursive: true });
-    writeFileSync(
-      join(outer, "package.json"),
-      '{\n  "packageManager": "yarn@4.5.0"\n}\n',
-    );
+    writeFileSync(join(outer, "package.json"), '{\n  "packageManager": "yarn@4.5.0"\n}\n');
     writeFileSync(
       join(repo, "package.json"),
       '{\n  "packageManager": "pnpm@11.2.2+sha512.test"\n}\n',
@@ -960,7 +1007,7 @@ describe("install-cli.sh", () => {
     const tmp = mkdtempSync(join(tmpdir(), "openclaw-install-cli-freshness-"));
     const prefix = join(tmp, "prefix");
     const home = join(tmp, "home");
-    const nodeBin = join(prefix, "tools/node-v22.22.0/bin");
+    const nodeBin = join(prefix, "tools/node-v24.18.0/bin");
     const argsLog = join(tmp, "npm-args.log");
     mkdirSync(nodeBin, { recursive: true });
     mkdirSync(home, { recursive: true });
@@ -996,7 +1043,7 @@ describe("install-cli.sh", () => {
     const prefix = join(tmp, "prefix");
     const home = join(tmp, "home");
     const project = join(tmp, "project");
-    const nodeBin = join(prefix, "tools/node-v22.22.0/bin");
+    const nodeBin = join(prefix, "tools/node-v24.18.0/bin");
     const argsLog = join(tmp, "npm-args.log");
     mkdirSync(nodeBin, { recursive: true });
     mkdirSync(home, { recursive: true });
