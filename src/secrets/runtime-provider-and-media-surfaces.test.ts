@@ -63,6 +63,26 @@ async function prepareMediaModelAuthSnapshot(params: {
 }
 
 describe("secrets runtime provider and media surfaces", () => {
+  it("resolves the mem0 backend API key ref", async () => {
+    const snapshot = await prepareSecretsRuntimeSnapshot({
+      config: asConfig({
+        memory: {
+          backend: "hybrid",
+          mem0: {
+            apiKey: envTokenRef("OPENCLAW_MEM0_API_KEY"),
+          },
+        },
+      }),
+      env: {
+        OPENCLAW_MEM0_API_KEY: "mem0-test-key",
+      },
+      agentDirs: ["/tmp/openclaw-agent-main"],
+      loadAuthStore: () => ({ version: 1, profiles: {} }),
+    });
+
+    expect(snapshot.config.memory?.mem0?.apiKey).toBe("mem0-test-key");
+  });
+
   it("resolves talk realtime provider api key refs", async () => {
     const snapshot = await prepareSecretsRuntimeSnapshot({
       config: asConfig({

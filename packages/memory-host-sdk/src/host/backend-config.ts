@@ -28,6 +28,7 @@ import {
   splitShellArgs,
 } from "./config-utils.js";
 import { isPathInside } from "./fs-utils.js";
+import { resolveMemorySecretInputString } from "./secret-input.js";
 import {
   normalizeLowercaseStringOrEmpty,
   normalizeStringEntries,
@@ -202,13 +203,12 @@ const DEFAULT_QMD_SCOPE: SessionSendPolicyConfig = {
 const DEFAULT_HYBRID_MAX_RESULTS = 8;
 const DEFAULT_HYBRID_READ_ORDER: MemoryHybridReadOrder[] = ["mem0", "qmd"];
 
-function joinUrlPath(basePath: string, fallbackPath: string): string {
+function normalizeUrlPath(basePath: string, fallbackPath: string): string {
   const trimmed = basePath.trim();
   if (!trimmed) {
     return fallbackPath;
   }
-  const prefixed = trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
-  return prefixed.endsWith("/") ? prefixed : `${prefixed}/`;
+  return trimmed.startsWith("/") ? trimmed : `/${trimmed}`;
 }
 
 function resolveMem0Config(raw: MemoryMem0Config | undefined): ResolvedMem0Config {
@@ -230,11 +230,14 @@ function resolveMem0Config(raw: MemoryMem0Config | undefined): ResolvedMem0Confi
   return {
     enabled: raw?.enabled !== false,
     baseUrl: normalizedBaseUrl,
-    apiKey: typeof raw?.apiKey === "string" ? raw.apiKey.trim() || undefined : undefined,
+    apiKey: resolveMemorySecretInputString({
+      value: raw?.apiKey,
+      path: "memory.mem0.apiKey",
+    }),
     userIdPrefix: raw?.userIdPrefix?.trim() || "openclaw-user",
     agentIdPrefix: raw?.agentIdPrefix?.trim() || "openclaw-agent",
-    searchPath: joinUrlPath(raw?.searchPath ?? "", DEFAULT_MEM0_SEARCH_PATH),
-    addPath: joinUrlPath(raw?.addPath ?? "", DEFAULT_MEM0_ADD_PATH),
+    searchPath: normalizeUrlPath(raw?.searchPath ?? "", DEFAULT_MEM0_SEARCH_PATH),
+    addPath: normalizeUrlPath(raw?.addPath ?? "", DEFAULT_MEM0_ADD_PATH),
     topK,
     threshold,
     timeoutMs,

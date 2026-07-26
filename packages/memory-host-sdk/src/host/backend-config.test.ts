@@ -126,6 +126,49 @@ describe("resolveMemoryBackendConfig", () => {
     });
   });
 
+  it("preserves custom mem0 endpoint trailing-slash semantics", () => {
+    const cfg = {
+      agents: { defaults: { workspace: "/tmp/memory-test" } },
+      memory: {
+        backend: "mem0",
+        mem0: {
+          baseUrl: "http://127.0.0.1:8000/",
+          searchPath: "search",
+          addPath: "/memories/",
+        },
+      },
+    } as OpenClawConfig;
+    const resolved = resolveMemoryBackendConfig({ cfg, agentId: "main" });
+    expect(resolved.mem0).toMatchObject({
+      baseUrl: "http://127.0.0.1:8000",
+      searchPath: "/search",
+      addPath: "/memories/",
+    });
+  });
+
+  it("resolves a mem0 API key from an environment SecretRef", () => {
+    vi.stubEnv("MEM0_BACKEND_CONFIG_TEST_KEY", "test-mem0-secret");
+    try {
+      const cfg = {
+        agents: { defaults: { workspace: "/tmp/memory-test" } },
+        memory: {
+          backend: "mem0",
+          mem0: {
+            apiKey: {
+              source: "env",
+              provider: "default",
+              id: "MEM0_BACKEND_CONFIG_TEST_KEY",
+            },
+          },
+        },
+      } as OpenClawConfig;
+      const resolved = resolveMemoryBackendConfig({ cfg, agentId: "main" });
+      expect(resolved.mem0?.apiKey).toBe("test-mem0-secret");
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it("resolves hybrid backend with routed defaults", () => {
     const cfg = {
       agents: { defaults: { workspace: "/tmp/memory-test" } },

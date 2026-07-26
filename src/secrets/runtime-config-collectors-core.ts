@@ -193,6 +193,34 @@ function collectAgentMemorySearchAssignments(params: {
   });
 }
 
+function collectMemoryBackendAssignments(params: {
+  config: OpenClawConfig;
+  defaults: SecretDefaults | undefined;
+  context: ResolverContext;
+}): void {
+  const memory = params.config.memory as Record<string, unknown> | undefined;
+  if (!isRecord(memory)) {
+    return;
+  }
+  const mem0 = isRecord(memory.mem0) ? memory.mem0 : undefined;
+  if (!mem0) {
+    return;
+  }
+  const backendIsActive = memory.backend === "mem0" || memory.backend === "hybrid";
+  collectSecretInputAssignment({
+    value: mem0.apiKey,
+    path: "memory.mem0.apiKey",
+    expected: "string",
+    defaults: params.defaults,
+    context: params.context,
+    active: backendIsActive && mem0.enabled !== false,
+    inactiveReason: "Mem0 memory backend is not active.",
+    apply: (value) => {
+      mem0.apiKey = value;
+    },
+  });
+}
+
 function collectTalkAssignments(params: {
   config: OpenClawConfig;
   defaults: SecretDefaults | undefined;
@@ -687,6 +715,7 @@ export function collectCoreConfigAssignments(params: {
   }
 
   collectAgentMemorySearchAssignments(params);
+  collectMemoryBackendAssignments(params);
   collectTalkAssignments(params);
   collectGatewayAssignments(params);
   collectSandboxSshAssignments(params);

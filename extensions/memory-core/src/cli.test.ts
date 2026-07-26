@@ -518,6 +518,7 @@ describe("memory cli", () => {
       new Set([
         "agents.defaults.memorySearch.remote.apiKey",
         "agents.list[].memorySearch.remote.apiKey",
+        "memory.mem0.apiKey",
       ]),
     );
   });

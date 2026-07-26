@@ -174,6 +174,17 @@ const CORE_SECRET_TARGET_REGISTRY: SecretTargetRegistryEntry[] = [
     includeInAudit: true,
   },
   {
+    id: "memory.mem0.apiKey",
+    targetType: "memory.mem0.apiKey",
+    configFile: "openclaw.json",
+    pathPattern: "memory.mem0.apiKey",
+    secretShape: SECRET_INPUT_SHAPE,
+    expectedResolvedValue: "string",
+    includeInPlan: true,
+    includeInConfigure: true,
+    includeInAudit: true,
+  },
+  {
     id: "cron.webhookToken",
     targetType: "cron.webhookToken",
     configFile: "openclaw.json",
