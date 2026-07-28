@@ -72,17 +72,26 @@ function readonlyScopedTabLabel(attemptId: string, generation: string) {
   return `${readonlyTabLabel(attemptId)}-${generationHash}`;
 }
 
-function readonlyConfig() {
+function readonlyScopedSessionKey(attemptId: string, generation: string) {
+  const identityHash = readonlyTabLabel(attemptId).replace("hermes-readonly-", "");
+  const generationHash = createHash("sha256").update(generation).digest("hex").slice(0, 16);
+  return (
+    "agent:missioncrew-browser-readonly:subagent:" +
+    `hermes-${attemptId}-${identityHash}-${generationHash}`
+  );
+}
+
+function readonlyConfig(additionalTasks: string[] = []) {
   return resolveHermesBridgeConfig({
     enabled: true,
     mode: "live",
     hermesMode: "real",
-    allowedTasks: ["openclaw.browser.read_snapshot"],
+    allowedTasks: ["openclaw.browser.read_snapshot", ...additionalTasks],
     allowedTools: ["browser.read"],
   });
 }
 
-function zeroEffectAsyncConfig() {
+function zeroEffectAsyncConfig(maxLiveRuntimeSeconds = 120) {
   return resolveHermesBridgeConfig({
     enabled: true,
     mode: "live",
@@ -93,6 +102,7 @@ function zeroEffectAsyncConfig() {
       "openclaw.agent.zero_effect_async_cancel",
     ],
     allowedTools: [],
+    maxLiveRuntimeSeconds,
   });
 }
 
@@ -745,24 +755,25 @@ describe("executeHermesBridgeTask", () => {
     expect(subagent.deleteSession).toHaveBeenCalledOnce();
   });
 
-  it("uses different tab labels and session keys for repeated execution generations", async () => {
+  it("uses different tab labels and session keys for different start keys", async () => {
     const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
     const subagent = successfulReadonlySubagent();
-    const repeatedRequest = readonlyRequest("attempt-generation-scope");
+    const firstRequest = readonlyRequest("attempt-generation-scope-1");
+    const secondRequest = readonlyRequest("attempt-generation-scope-2");
 
     mockSuccessfulBrowser("tab-generation-1");
     const first = await executeHermesBridgeTask({
       config: readonlyConfig(),
       subagent,
       cleanupStore,
-      request: repeatedRequest,
+      request: firstRequest,
     });
     mockSuccessfulBrowser("tab-generation-2");
     const second = await executeHermesBridgeTask({
       config: readonlyConfig(),
       subagent,
       cleanupStore,
-      request: repeatedRequest,
+      request: secondRequest,
     });
 
     expect(first.ok).toBe(true);
@@ -1015,7 +1026,7 @@ describe("executeHermesBridgeTask", () => {
 
     expect(completed).toBe(1);
     expect(cleanupStore.listDueCleanup(Number.MAX_SAFE_INTEGER)).toEqual([]);
-    expect(subagent.deleteSession).toHaveBeenCalledTimes(4);
+    expect(subagent.deleteSession).toHaveBeenCalledTimes(1);
     expect(
       dispatchGatewayMethod.mock.calls.filter(
         ([method, params]) =>
@@ -1064,6 +1075,70 @@ describe("executeHermesBridgeTask", () => {
     for (const [params] of subagent.waitForRun.mock.calls) {
       expect(params.runId).toBe("run-generation-terminal");
     }
+  });
+
+  it("persists cancellation before aborting an overdue browser run", async () => {
+    const attemptId = "attempt-durable-run-abort";
+    const pendingRequest = readonlyRequest(attemptId);
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    cleanupStore.registerCleanup({
+      idempotencyKey: pendingRequest.idempotencyKey,
+      requestHash: "request-hash-abort",
+      generation: "generation-run-abort",
+      backendAdmissionKey: "admission-generation-abort",
+      backendRunId: "run-generation-abort",
+      backendStartAttempted: true,
+      backendSubmission: readonlyBackendSubmission("run-generation-abort"),
+      request: pendingRequest,
+      dueAt: 0,
+    });
+    dispatchGatewayMethod.mockResolvedValue({
+      ok: true,
+      payload: { tabs: [] },
+    });
+    const subagent = successfulReadonlySubagent();
+    subagent.run.mockResolvedValue({ runId: "run-generation-abort" });
+    subagent.waitForRun
+      .mockResolvedValueOnce({ status: "timeout", terminal: false })
+      .mockResolvedValueOnce({ status: "timeout", terminal: false })
+      .mockResolvedValueOnce({ status: "timeout", terminal: false })
+      .mockImplementationOnce(async () => {
+        expect(
+          cleanupStore.getCleanup(pendingRequest.idempotencyKey)?.auditedTerminal,
+        ).toMatchObject({
+          output: {
+            evidence: {
+              cancellationRequested: true,
+              terminationProven: false,
+              sessionCleaned: false,
+            },
+          },
+        });
+        expect(subagent.deleteSession).toHaveBeenCalledTimes(1);
+        return { status: "timeout", terminal: true };
+      });
+
+    const completed = await sweepHermesBridgeCleanupObligations({
+      store: cleanupStore,
+      subagent,
+      config: readonlyConfig(),
+      nowMs: 1,
+    });
+
+    expect(completed).toBe(1);
+    expect(cleanupStore.getCleanup(pendingRequest.idempotencyKey)).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal(pendingRequest.idempotencyKey)).toMatchObject({
+      backendRunId: "run-generation-abort",
+      output: {
+        bridgeStatus: "blocked",
+        evidence: {
+          cancellationRequested: true,
+          terminationProven: true,
+          sessionCleaned: true,
+          browserTabsCleaned: true,
+        },
+      },
+    });
   });
 
   it("fails before resource creation while an older cleanup generation is actively claimed", async () => {
@@ -1525,7 +1600,6 @@ describe("executeHermesBridgeTask", () => {
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
     } satisfies PluginRuntime["subagent"];
-
     const result = await executeHermesBridgeTask({
       config: readonlyConfig(),
       subagent,
@@ -1703,6 +1777,249 @@ describe("executeHermesBridgeTask", () => {
     expect(subagent.run).not.toHaveBeenCalled();
   });
 
+  it("replays a completed browser snapshot from its terminal tombstone", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    mockSuccessfulBrowser("tab-browser-terminal");
+    const subagent = successfulReadonlySubagent();
+    const browserRequest = readonlyRequest("attempt-browser-terminal");
+    const audited = vi.spyOn(cleanupStore, "setCleanupAuditedTerminal");
+    const completedCleanup = vi.spyOn(cleanupStore, "completeCleanup");
+
+    const completed = await executeHermesBridgeTask({
+      config: readonlyConfig(),
+      request: browserRequest,
+      subagent,
+      cleanupStore,
+    });
+    expect(completed).toMatchObject({
+      ok: true,
+      status: "succeeded",
+      output: { bridgeStatus: "succeeded" },
+    });
+    expect(cleanupStore.getCleanup("attempt-browser-terminal")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("attempt-browser-terminal")).toMatchObject({
+      output: { bridgeStatus: "succeeded" },
+    });
+    expect(audited).toHaveBeenCalledOnce();
+    expect(audited.mock.invocationCallOrder[0]).toBeLessThan(
+      subagent.deleteSession.mock.invocationCallOrder[0]!,
+    );
+    expect(subagent.deleteSession.mock.invocationCallOrder[0]).toBeLessThan(
+      completedCleanup.mock.invocationCallOrder[0]!,
+    );
+    const browserCallCount = dispatchGatewayMethod.mock.calls.length;
+
+    const replayed = await executeHermesBridgeTask({
+      config: readonlyConfig(),
+      request: browserRequest,
+      subagent,
+      cleanupStore,
+    });
+    expect(replayed).toMatchObject({
+      ok: true,
+      status: "succeeded",
+      output: { bridgeStatus: "succeeded" },
+    });
+    expect(dispatchGatewayMethod).toHaveBeenCalledTimes(browserCallCount);
+    expect(subagent.run).toHaveBeenCalledOnce();
+  });
+
+  it("polls and finalizes an exact admitted browser snapshot run", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const startRequest = readonlyRequest("attempt-browser-poll");
+    const requestHash = hashHermesBridgeRequest(startRequest);
+    const generation = "browser-poll-generation";
+    const generationHash = createHash("sha256").update(generation).digest("hex").slice(0, 16);
+    const identityHash = readonlyTabLabel("attempt-browser-poll").replace("hermes-readonly-", "");
+    const sessionKey =
+      `agent:missioncrew-browser-readonly:subagent:` +
+      `hermes-attempt-browser-poll-${identityHash}-${generationHash}`;
+    const backendRunId = "browser-poll-run";
+    cleanupStore.registerCleanup({
+      idempotencyKey: "attempt-browser-poll",
+      requestHash,
+      generation,
+      backendAdmissionKey: "browser-poll-admission",
+      backendRunId,
+      backendStartAttempted: true,
+      backendSubmission: {
+        sessionKey,
+        message: [
+          "Review captured evidence.",
+          JSON.stringify({
+            url: "https://example.com/",
+            title: "Example Domain",
+            snapshotExcerpt: "Example Domain",
+            targetId: "tab-browser-poll",
+            externalEffectBudget: 0,
+            sideEffectsPerformed: false,
+          }),
+        ].join("\n"),
+        extraSystemPrompt: "Do not use tools.",
+        lane: "hermes-bridge:test",
+        lightContext: true,
+        deliver: false,
+        toolsAllow: [],
+        disableTools: true,
+      },
+      request: startRequest,
+      dueAt: Date.now(),
+    });
+    dispatchGatewayMethod
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          tabs: [
+            {
+              targetId: "tab-browser-poll",
+              label: readonlyScopedTabLabel("attempt-browser-poll", generation),
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({ ok: true, payload: { ok: true } });
+    const subagent = successfulReadonlySubagent();
+    const audited = vi.spyOn(cleanupStore, "setCleanupAuditedTerminal");
+    const completedCleanup = vi.spyOn(cleanupStore, "completeCleanup");
+    const pollRequest = request({
+      protocolVersion: "2.0",
+      taskId: "openclaw.browser.read_snapshot_poll",
+      idempotencyKey: "attempt-browser-poll:poll:1",
+      dryRun: false,
+      allowedTools: ["browser.read"],
+      input: {
+        startIdempotencyKey: "attempt-browser-poll",
+        backendRunId,
+      },
+      identity: startRequest.identity,
+      routing: startRequest.routing,
+      policy: startRequest.policy,
+    });
+
+    const polled = await executeHermesBridgeTask({
+      config: readonlyConfig(["openclaw.browser.read_snapshot_poll"]),
+      request: pollRequest,
+      subagent,
+      cleanupStore,
+    });
+
+    expect(polled).toMatchObject({
+      ok: true,
+      status: "succeeded",
+      backendExecution: { backendRunId, sessionKey },
+      output: {
+        evidence: {
+          terminal: true,
+          sessionCleaned: true,
+          browserTabsCleaned: true,
+        },
+        resultText: validReviewerResult,
+      },
+    });
+    expect(subagent.waitForRun).toHaveBeenCalledWith({
+      runId: backendRunId,
+      timeoutMs: 1,
+    });
+    expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
+    expect(audited).toHaveBeenCalledOnce();
+    expect(completedCleanup).toHaveBeenCalledOnce();
+    expect(audited.mock.invocationCallOrder[0]).toBeLessThan(
+      subagent.deleteSession.mock.invocationCallOrder[0]!,
+    );
+    expect(subagent.deleteSession.mock.invocationCallOrder[0]).toBeLessThan(
+      completedCleanup.mock.invocationCallOrder[0]!,
+    );
+    expect(cleanupStore.getCleanup("attempt-browser-poll")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("attempt-browser-poll")).toMatchObject({
+      backendRunId,
+      output: { bridgeStatus: "succeeded" },
+    });
+  });
+
+  it("cancels an exact browser snapshot run and persists terminal cleanup evidence", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const startRequest = readonlyRequest("attempt-browser-cancel");
+    const requestHash = hashHermesBridgeRequest(startRequest);
+    const generation = "browser-cancel-generation";
+    const backendRunId = "browser-cancel-run";
+    const backendSubmission = {
+      ...readonlyBackendSubmission(backendRunId),
+      sessionKey: readonlyScopedSessionKey("attempt-browser-cancel", generation),
+    };
+    cleanupStore.registerCleanup({
+      idempotencyKey: "attempt-browser-cancel",
+      requestHash,
+      generation,
+      backendAdmissionKey: "browser-cancel-admission",
+      backendRunId,
+      backendStartAttempted: true,
+      backendSubmission,
+      request: startRequest,
+      dueAt: Date.now(),
+    });
+    dispatchGatewayMethod
+      .mockResolvedValueOnce({
+        ok: true,
+        payload: {
+          tabs: [
+            {
+              targetId: "tab-browser-cancel",
+              label: readonlyScopedTabLabel("attempt-browser-cancel", generation),
+            },
+          ],
+        },
+      })
+      .mockResolvedValueOnce({ ok: true, payload: { ok: true } });
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+    const cancelRequest = request({
+      protocolVersion: "2.0",
+      taskId: "openclaw.browser.read_snapshot_cancel",
+      idempotencyKey: "attempt-browser-cancel:cancel",
+      dryRun: false,
+      allowedTools: ["browser.read"],
+      input: {
+        startIdempotencyKey: "attempt-browser-cancel",
+        backendRunId,
+      },
+      identity: startRequest.identity,
+      routing: startRequest.routing,
+      policy: startRequest.policy,
+    });
+
+    const cancelled = await executeHermesBridgeTask({
+      config: readonlyConfig(["openclaw.browser.read_snapshot_cancel"]),
+      request: cancelRequest,
+      subagent,
+      cleanupStore,
+    });
+
+    expect(cancelled).toMatchObject({
+      ok: true,
+      status: "blocked",
+      backendExecution: { backendRunId },
+      output: {
+        evidence: {
+          terminal: true,
+          cancellationRequested: true,
+          browserTabsCleaned: true,
+          sessionCleaned: true,
+        },
+      },
+    });
+    expect(subagent.deleteSession).toHaveBeenCalledOnce();
+    expect(cleanupStore.getCleanup("attempt-browser-cancel")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("attempt-browser-cancel")).toMatchObject({
+      backendRunId,
+      output: { bridgeStatus: "blocked" },
+    });
+  });
+
   it("runs a real zero-effect async task through accepted, running, and terminal states", async () => {
     const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
     const subagent = {
@@ -1722,6 +2039,8 @@ describe("executeHermesBridgeTask", () => {
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
     } satisfies PluginRuntime["subagent"];
+    const audited = vi.spyOn(cleanupStore, "setCleanupAuditedTerminal");
+    const completedCleanup = vi.spyOn(cleanupStore, "completeCleanup");
 
     const started = await executeHermesBridgeTask({
       config: zeroEffectAsyncConfig(),
@@ -1795,7 +2114,305 @@ describe("executeHermesBridgeTask", () => {
       }),
     );
     expect(subagent.deleteSession).toHaveBeenCalledTimes(1);
+    expect(audited).toHaveBeenCalledOnce();
+    expect(audited.mock.invocationCallOrder[0]).toBeLessThan(
+      subagent.deleteSession.mock.invocationCallOrder[0]!,
+    );
+    expect(subagent.deleteSession.mock.invocationCallOrder[0]).toBeLessThan(
+      completedCleanup.mock.invocationCallOrder[0]!,
+    );
     expect(cleanupStore.getCleanup("async-start-1")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("async-start-1")).toMatchObject({
+      backendRunId: "async-run-1",
+      output: {
+        bridgeStatus: "succeeded",
+        evidence: { terminal: true, sessionCleaned: true },
+      },
+    });
+
+    const replayed = await executeHermesBridgeTask({
+      config: zeroEffectAsyncConfig(),
+      request: zeroEffectAsyncRequest("openclaw.agent.zero_effect_async_poll", "async-poll-3", {
+        startIdempotencyKey: "async-start-1",
+        backendRunId: "async-run-1",
+      }),
+      subagent,
+      cleanupStore,
+    });
+    expect(replayed).toMatchObject({
+      ok: true,
+      status: "succeeded",
+      output: { evidence: { terminal: true, sessionCleaned: true } },
+    });
+    expect(subagent.waitForRun).toHaveBeenCalledTimes(2);
+  });
+
+  it("uses the start idempotency key to isolate otherwise identical async sessions", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const sessionKeys: string[] = [];
+    const subagent = {
+      run: vi.fn(async (params: Parameters<PluginRuntime["subagent"]["run"]>[0]) => {
+        sessionKeys.push(params.sessionKey);
+        return { runId: `run-${sessionKeys.length}` };
+      }),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    for (const idempotencyKey of ["isolated-start-1", "isolated-start-2"]) {
+      const result = await executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(),
+        request: zeroEffectAsyncRequest("openclaw.agent.zero_effect_async_start", idempotencyKey),
+        subagent,
+        cleanupStore,
+      });
+      expect(result.status).toBe("accepted");
+    }
+
+    expect(sessionKeys).toHaveLength(2);
+    expect(sessionKeys[0]).not.toBe(sessionKeys[1]);
+  });
+
+  it("bounds and reconciles a hanging zero-effect async admission", async () => {
+    vi.useFakeTimers();
+    try {
+      const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+      const subagent = {
+        run: vi.fn(() => new Promise<never>(() => {})),
+        waitForRun: vi.fn(),
+        getSessionMessages: vi.fn(),
+        getSession: vi.fn(),
+        deleteSession: vi.fn(),
+      } satisfies PluginRuntime["subagent"];
+      const execution = executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(1),
+        request: zeroEffectAsyncRequest(
+          "openclaw.agent.zero_effect_async_start",
+          "async-timeout-start",
+        ),
+        subagent,
+        cleanupStore,
+      });
+
+      await vi.advanceTimersByTimeAsync(1_001);
+      await expect(execution).resolves.toMatchObject({
+        ok: true,
+        status: "running",
+        output: {
+          evidence: {
+            admissionPending: true,
+            terminal: false,
+          },
+        },
+      });
+      expect(subagent.deleteSession).not.toHaveBeenCalled();
+      expect(cleanupStore.getCleanup("async-timeout-start")).toMatchObject({
+        backendStartAttempted: true,
+        backendAdmissionKey: expect.any(String),
+      });
+      subagent.run.mockResolvedValueOnce({ runId: "async-timeout-reconciled" });
+      const reconciled = executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(1),
+        request: zeroEffectAsyncRequest(
+          "openclaw.agent.zero_effect_async_start",
+          "async-timeout-start",
+        ),
+        subagent,
+        cleanupStore,
+      });
+      await expect(reconciled).resolves.toMatchObject({
+        ok: true,
+        status: "accepted",
+        backendExecution: {
+          backendRunId: "async-timeout-reconciled",
+        },
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("marks a reconciled async admission attempted before dispatch", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const startRequest = zeroEffectAsyncRequest(
+      "openclaw.agent.zero_effect_async_start",
+      "async-submission-only-start",
+    );
+    const requestHash = hashHermesBridgeRequest(startRequest);
+    cleanupStore.registerCleanup({
+      idempotencyKey: startRequest.idempotencyKey,
+      requestHash,
+      generation: "async-submission-only-generation",
+      backendAdmissionKey: "async-submission-only-admission",
+      backendSubmission: {
+        sessionKey: "agent:missioncrew-browser-readonly:subagent:submission-only",
+        message: "Complete zero-effect work.",
+        extraSystemPrompt: "Do not use tools.",
+        lane: "hermes-bridge:submission-only",
+        lightContext: true,
+        deliver: false,
+        toolsAllow: [],
+        disableTools: true,
+      },
+      request: startRequest,
+      dueAt: 1,
+    });
+    const marked = vi.spyOn(cleanupStore, "markCleanupBackendStartAttempted");
+    const subagent = {
+      run: vi.fn(async () => {
+        expect(cleanupStore.getCleanup(startRequest.idempotencyKey)).toMatchObject({
+          backendStartAttempted: true,
+        });
+        expect(marked).toHaveBeenCalledOnce();
+        return { runId: "async-submission-only-run" };
+      }),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    await expect(
+      executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(),
+        request: startRequest,
+        subagent,
+        cleanupStore,
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      status: "accepted",
+      backendExecution: {
+        backendRunId: "async-submission-only-run",
+      },
+    });
+  });
+
+  it("does not classify a definitive async admission rejection as pending", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const subagent = {
+      run: vi.fn().mockRejectedValue(
+        Object.assign(new Error("backend authentication rejected"), {
+          code: "UNAUTHENTICATED",
+        }),
+      ),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    await expect(
+      executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(),
+        request: zeroEffectAsyncRequest(
+          "openclaw.agent.zero_effect_async_start",
+          "async-definitive-rejection",
+        ),
+        subagent,
+        cleanupStore,
+      }),
+    ).resolves.toMatchObject({
+      ok: false,
+      status: "failed",
+      error: { type: "task_execution_failed" },
+    });
+    expect(cleanupStore.getCleanup("async-definitive-rejection")).toBeUndefined();
+  });
+
+  it("retains async admission identity after an ambiguous transport rejection", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const subagent = {
+      run: vi.fn().mockRejectedValue(new Error("connection reset")),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    await expect(
+      executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(),
+        request: zeroEffectAsyncRequest(
+          "openclaw.agent.zero_effect_async_start",
+          "async-ambiguous-rejection",
+        ),
+        subagent,
+        cleanupStore,
+      }),
+    ).resolves.toMatchObject({
+      ok: true,
+      status: "running",
+      output: {
+        evidence: {
+          admissionPending: true,
+          terminal: false,
+        },
+      },
+    });
+    expect(cleanupStore.getCleanup("async-ambiguous-rejection")).toMatchObject({
+      backendStartAttempted: true,
+      backendAdmissionKey: expect.any(String),
+      backendSubmission: expect.any(Object),
+    });
+  });
+
+  it("retains a prior ambiguous admission after a later definitive rejection", async () => {
+    vi.useFakeTimers();
+    try {
+      const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+      const subagent = {
+        run: vi.fn(() => new Promise<never>(() => {})),
+        waitForRun: vi.fn(),
+        getSessionMessages: vi.fn(),
+        getSession: vi.fn(),
+        deleteSession: vi.fn(),
+      } satisfies PluginRuntime["subagent"];
+      const request = zeroEffectAsyncRequest(
+        "openclaw.agent.zero_effect_async_start",
+        "async-ambiguous-then-rejected",
+      );
+      const first = executeHermesBridgeTask({
+        config: zeroEffectAsyncConfig(1),
+        request,
+        subagent,
+        cleanupStore,
+      });
+      await vi.advanceTimersByTimeAsync(1_001);
+      await expect(first).resolves.toMatchObject({
+        ok: true,
+        status: "running",
+        output: { evidence: { admissionPending: true } },
+      });
+      const original = cleanupStore.getCleanup(request.idempotencyKey);
+      subagent.run.mockRejectedValueOnce(
+        Object.assign(new Error("backend precondition changed"), {
+          code: "FAILED_PRECONDITION",
+        }),
+      );
+
+      await expect(
+        executeHermesBridgeTask({
+          config: zeroEffectAsyncConfig(1),
+          request,
+          subagent,
+          cleanupStore,
+        }),
+      ).resolves.toMatchObject({
+        ok: true,
+        status: "running",
+        output: { evidence: { admissionPending: true } },
+      });
+      expect(cleanupStore.getCleanup(request.idempotencyKey)).toMatchObject({
+        generation: original?.generation,
+        backendAdmissionKey: original?.backendAdmissionKey,
+        backendStartAttempted: true,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("aborts and cleans an exact zero-effect async run at a stop rule", async () => {
@@ -1851,6 +2468,13 @@ describe("executeHermesBridgeTask", () => {
       ),
     });
     expect(cleanupStore.getCleanup("async-cancel-start")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("async-cancel-start")).toMatchObject({
+      backendRunId: "async-cancel-run",
+      output: {
+        bridgeStatus: "blocked",
+        evidence: { cancellationRequested: true, terminal: true },
+      },
+    });
   });
 
   it("returns retryable running when async poll cleanup state is unavailable", async () => {
@@ -1858,7 +2482,14 @@ describe("executeHermesBridgeTask", () => {
     const subagent = {
       run: vi.fn().mockResolvedValue({ runId: "async-store-run" }),
       waitForRun: vi.fn(),
-      getSessionMessages: vi.fn(),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: [
+          {
+            role: "assistant",
+            content: '{"result":"zero-effect async completed","sideEffectsPerformed":false}',
+          },
+        ],
+      }),
       getSession: vi.fn(),
       deleteSession: vi.fn(),
     } satisfies PluginRuntime["subagent"];
@@ -1899,7 +2530,14 @@ describe("executeHermesBridgeTask", () => {
     const subagent = {
       run: vi.fn().mockResolvedValue({ runId: "async-abandoned-run" }),
       waitForRun: vi.fn().mockResolvedValue({ status: "ok", terminal: true }),
-      getSessionMessages: vi.fn(),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: [
+          {
+            role: "assistant",
+            content: '{"result":"zero-effect async completed","sideEffectsPerformed":false}',
+          },
+        ],
+      }),
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
     } satisfies PluginRuntime["subagent"];
@@ -1931,5 +2569,53 @@ describe("executeHermesBridgeTask", () => {
     });
     expect(subagent.deleteSession).toHaveBeenCalledOnce();
     expect(cleanupStore.getCleanup("async-abandoned-start")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("async-abandoned-start")).toMatchObject({
+      backendRunId: "async-abandoned-run",
+      output: { bridgeStatus: "succeeded", evidence: { terminal: true } },
+    });
+  });
+
+  it("cleans and tombstones a terminal async run whose transcript audit fails", async () => {
+    const cleanupStore = new MemoryHermesBridgeIdempotencyStore();
+    const subagent = {
+      run: vi.fn().mockResolvedValue({ runId: "async-invalid-audit-run" }),
+      waitForRun: vi.fn().mockResolvedValue({ status: "ok", terminal: true }),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: [{ role: "assistant", content: "unexpected result" }],
+      }),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+
+    await executeHermesBridgeTask({
+      config: zeroEffectAsyncConfig(),
+      request: zeroEffectAsyncRequest(
+        "openclaw.agent.zero_effect_async_start",
+        "async-invalid-audit-start",
+      ),
+      subagent,
+      cleanupStore,
+    });
+    const completed = await sweepHermesBridgeCleanupObligations({
+      store: cleanupStore,
+      subagent,
+      config: zeroEffectAsyncConfig(),
+      nowMs: Number.MAX_SAFE_INTEGER,
+    });
+
+    expect(completed).toBe(1);
+    expect(subagent.deleteSession).toHaveBeenCalledOnce();
+    expect(cleanupStore.getCleanup("async-invalid-audit-start")).toBeUndefined();
+    expect(cleanupStore.getCleanupTerminal("async-invalid-audit-start")).toMatchObject({
+      backendRunId: "async-invalid-audit-run",
+      output: {
+        bridgeStatus: "failed",
+        evidence: {
+          terminal: true,
+          auditPassed: false,
+          sessionCleaned: true,
+        },
+      },
+    });
   });
 });

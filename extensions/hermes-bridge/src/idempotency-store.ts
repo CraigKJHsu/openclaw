@@ -30,6 +30,7 @@ export type HermesBridgeCleanupObligation = {
   backendRunId?: string;
   backendStartAttempted?: boolean;
   backendSubmission?: HermesBridgeBackendSubmission;
+  auditedTerminal?: HermesBridgeAsyncTerminalState;
   request: HermesBridgeRequest;
   dueAt: number;
 };
@@ -43,6 +44,16 @@ export type HermesBridgeBackendSubmission = {
   deliver: false;
   toolsAllow: [];
   disableTools: true;
+};
+
+export type HermesBridgeAsyncTerminalState = {
+  idempotencyKey: string;
+  requestHash: string;
+  generation: string;
+  backendRunId: string;
+  request: HermesBridgeRequest;
+  output: Record<string, unknown>;
+  completedAt: number;
 };
 
 export class HermesBridgeCleanupPendingError extends Error {
@@ -73,7 +84,7 @@ export type HermesBridgeIdempotencyStore = {
   ) => HermesBridgeIdempotencyClaim;
   release: (key: string, requestHash: string, ownerId: string) => void;
   set: (key: string, value: HermesBridgeIdempotencyEntry, ownerId?: string) => void;
-  registerCleanup: (obligation: HermesBridgeCleanupObligation, nowMs?: number) => void;
+  registerCleanup: (obligation: HermesBridgeCleanupObligation, nowMs?: number) => boolean;
   markCleanupBackendStartAttempted: (
     key: string,
     requestHash: string,
@@ -103,6 +114,21 @@ export type HermesBridgeIdempotencyStore = {
     options: HermesBridgeIdempotencyClaimOptions,
   ) => boolean;
   releaseCleanup: (key: string, requestHash: string, generation: string, ownerId: string) => void;
+  setCleanupAuditedTerminal: (
+    key: string,
+    requestHash: string,
+    generation: string,
+    ownerId: string,
+    terminal: HermesBridgeAsyncTerminalState,
+  ) => void;
+  completeCleanup: (
+    key: string,
+    requestHash: string,
+    generation: string,
+    ownerId: string,
+    terminal: HermesBridgeAsyncTerminalState,
+  ) => void;
+  getCleanupTerminal: (key: string) => HermesBridgeAsyncTerminalState | undefined;
   clearCleanup: (key: string, requestHash: string, generation: string, ownerId?: string) => void;
   close?: () => void;
 };
@@ -135,6 +161,7 @@ export class MemoryHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
     string,
     { obligation: HermesBridgeCleanupObligation; ownerId: string; expiresAt: number }
   >();
+  readonly cleanupTerminals = new Map<string, HermesBridgeAsyncTerminalState>();
 
   get(key: string): HermesBridgeIdempotencyEntry | undefined {
     return this.entries.get(key);
@@ -201,10 +228,13 @@ export class MemoryHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
     }
   }
 
-  registerCleanup(obligation: HermesBridgeCleanupObligation, _nowMs = Date.now()): void {
+  registerCleanup(obligation: HermesBridgeCleanupObligation, _nowMs = Date.now()): boolean {
     const reservedHash = this.reservations.get(obligation.idempotencyKey);
     if (reservedHash && reservedHash !== obligation.requestHash) {
       throw new Error("Idempotency key is reserved for a different request hash.");
+    }
+    if (this.cleanupTerminals.has(obligation.idempotencyKey)) {
+      return false;
     }
     this.reservations.set(obligation.idempotencyKey, obligation.requestHash);
     if (this.cleanup.has(obligation.idempotencyKey)) {
@@ -215,6 +245,7 @@ export class MemoryHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
       ownerId: "",
       expiresAt: 0,
     });
+    return true;
   }
 
   markCleanupBackendStartAttempted(
@@ -341,6 +372,73 @@ export class MemoryHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
     }
   }
 
+  setCleanupAuditedTerminal(
+    key: string,
+    requestHash: string,
+    generation: string,
+    ownerId: string,
+    terminal: HermesBridgeAsyncTerminalState,
+  ): void {
+    const entry = this.cleanup.get(key);
+    if (
+      !entry ||
+      entry.obligation.requestHash !== requestHash ||
+      entry.obligation.generation !== generation ||
+      entry.ownerId !== ownerId ||
+      terminal.idempotencyKey !== key ||
+      terminal.requestHash !== requestHash ||
+      terminal.generation !== generation ||
+      terminal.backendRunId !== entry.obligation.backendRunId
+    ) {
+      throw new Error("Cleanup audited terminal identity no longer matches.");
+    }
+    this.cleanup.set(key, {
+      ...entry,
+      obligation: {
+        ...entry.obligation,
+        auditedTerminal: structuredClone(terminal),
+      },
+    });
+  }
+
+  completeCleanup(
+    key: string,
+    requestHash: string,
+    generation: string,
+    ownerId: string,
+    terminal: HermesBridgeAsyncTerminalState,
+  ): void {
+    const entry = this.cleanup.get(key);
+    if (
+      !entry ||
+      entry.obligation.requestHash !== requestHash ||
+      entry.obligation.generation !== generation ||
+      entry.ownerId !== ownerId ||
+      terminal.idempotencyKey !== key ||
+      terminal.requestHash !== requestHash ||
+      terminal.generation !== generation ||
+      terminal.backendRunId !== entry.obligation.backendRunId
+    ) {
+      throw new Error("Cleanup obligation ownership or terminal identity no longer matches.");
+    }
+    const existing = this.cleanupTerminals.get(key);
+    if (
+      existing &&
+      (existing.requestHash !== requestHash ||
+        existing.generation !== generation ||
+        existing.backendRunId !== terminal.backendRunId)
+    ) {
+      throw new Error("Cleanup terminal tombstone conflicts with an earlier execution.");
+    }
+    this.cleanupTerminals.set(key, structuredClone(terminal));
+    this.cleanup.delete(key);
+  }
+
+  getCleanupTerminal(key: string): HermesBridgeAsyncTerminalState | undefined {
+    const terminal = this.cleanupTerminals.get(key);
+    return terminal ? structuredClone(terminal) : undefined;
+  }
+
   clearCleanup(key: string, requestHash: string, generation: string, ownerId?: string): void {
     const entry = this.cleanup.get(key);
     if (
@@ -409,6 +507,7 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
         backend_run_id TEXT NOT NULL DEFAULT '',
         backend_start_attempted INTEGER NOT NULL DEFAULT 1,
         backend_submission_json TEXT NOT NULL DEFAULT '',
+        audited_terminal_json TEXT NOT NULL DEFAULT '',
         request_json TEXT NOT NULL,
         due_at INTEGER NOT NULL,
         cleanup_owner TEXT NOT NULL DEFAULT '',
@@ -422,6 +521,15 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
         due_at INTEGER NOT NULL,
         reason TEXT NOT NULL,
         quarantined_at TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS hermes_bridge_async_terminal (
+        idempotency_key TEXT PRIMARY KEY,
+        request_hash TEXT NOT NULL,
+        generation TEXT NOT NULL,
+        backend_run_id TEXT NOT NULL,
+        request_json TEXT NOT NULL,
+        output_json TEXT NOT NULL,
+        completed_at INTEGER NOT NULL
       );
     `);
     const claimColumns = new Set(
@@ -484,6 +592,11 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
         "ALTER TABLE hermes_bridge_cleanup_obligations ADD COLUMN backend_submission_json TEXT NOT NULL DEFAULT ''",
       );
     }
+    if (!cleanupColumns.has("audited_terminal_json")) {
+      this.db.exec(
+        "ALTER TABLE hermes_bridge_cleanup_obligations ADD COLUMN audited_terminal_json TEXT NOT NULL DEFAULT ''",
+      );
+    }
     if (!cleanupColumns.has("cleanup_owner")) {
       this.db.exec(
         "ALTER TABLE hermes_bridge_cleanup_obligations ADD COLUMN cleanup_owner TEXT NOT NULL DEFAULT ''",
@@ -516,6 +629,10 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
         (idempotency_key, request_hash, created_at)
       SELECT idempotency_key, request_hash, quarantined_at
         FROM hermes_bridge_cleanup_quarantine;
+      INSERT OR IGNORE INTO hermes_bridge_idempotency_reservations
+        (idempotency_key, request_hash, created_at)
+      SELECT idempotency_key, request_hash, datetime(completed_at / 1000, 'unixepoch')
+        FROM hermes_bridge_async_terminal;
     `);
     this.quarantineCleanupRows(
       "cleanup row lacks authoritative backend submission identity",
@@ -742,9 +859,20 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
     }
   }
 
-  registerCleanup(obligation: HermesBridgeCleanupObligation, nowMs = Date.now()): void {
+  registerCleanup(obligation: HermesBridgeCleanupObligation, nowMs = Date.now()): boolean {
     this.db.exec("BEGIN IMMEDIATE");
     try {
+      const terminal = this.db
+        .prepare(
+          `SELECT 1
+             FROM hermes_bridge_async_terminal
+            WHERE idempotency_key = ?`,
+        )
+        .get(obligation.idempotencyKey);
+      if (terminal) {
+        this.db.exec("COMMIT");
+        return false;
+      }
       const reservation = this.db
         .prepare(
           `SELECT request_hash
@@ -778,13 +906,14 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
                backend_run_id,
                backend_start_attempted,
                backend_submission_json,
+               audited_terminal_json,
                request_json,
                due_at,
                cleanup_owner,
                cleanup_expires_at,
                created_at
            )
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', 0, ?)
            ON CONFLICT(idempotency_key) DO NOTHING`,
         )
         .run(
@@ -795,6 +924,7 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
           obligation.backendRunId ?? "",
           obligation.backendStartAttempted ? 1 : 0,
           obligation.backendSubmission ? JSON.stringify(obligation.backendSubmission) : "",
+          obligation.auditedTerminal ? JSON.stringify(obligation.auditedTerminal) : "",
           JSON.stringify(obligation.request),
           obligation.dueAt,
           new Date(nowMs).toISOString(),
@@ -803,6 +933,7 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
         throw new HermesBridgeCleanupPendingError();
       }
       this.db.exec("COMMIT");
+      return true;
     } catch (error) {
       this.db.exec("ROLLBACK");
       throw error;
@@ -878,7 +1009,8 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
     const rows = this.db
       .prepare(
         `SELECT idempotency_key, request_hash, generation, backend_admission_key, backend_run_id,
-                backend_start_attempted, backend_submission_json, request_json, due_at
+                backend_start_attempted, backend_submission_json, audited_terminal_json,
+                request_json, due_at
            FROM hermes_bridge_cleanup_obligations
           WHERE due_at <= ?
             AND generation <> ''
@@ -896,6 +1028,7 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
       backend_run_id?: unknown;
       backend_start_attempted?: unknown;
       backend_submission_json?: unknown;
+      audited_terminal_json?: unknown;
       request_json?: unknown;
       due_at?: unknown;
     }>;
@@ -929,6 +1062,13 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
                 ) as HermesBridgeBackendSubmission,
               }
             : {}),
+          ...(typeof row.audited_terminal_json === "string" && row.audited_terminal_json
+            ? {
+                auditedTerminal: JSON.parse(
+                  row.audited_terminal_json,
+                ) as HermesBridgeAsyncTerminalState,
+              }
+            : {}),
           request: JSON.parse(row.request_json) as HermesBridgeRequest,
           dueAt: row.due_at,
         });
@@ -941,9 +1081,69 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
   }
 
   getCleanup(key: string): HermesBridgeCleanupObligation | undefined {
-    return this.listDueCleanup(Number.MAX_SAFE_INTEGER).find(
-      (obligation) => obligation.idempotencyKey === key,
-    );
+    const row = this.db
+      .prepare(
+        `SELECT idempotency_key, request_hash, generation, backend_admission_key, backend_run_id,
+                backend_start_attempted, backend_submission_json, audited_terminal_json,
+                request_json, due_at
+           FROM hermes_bridge_cleanup_obligations
+          WHERE idempotency_key = ?`,
+      )
+      .get(key) as
+      | {
+          idempotency_key?: unknown;
+          request_hash?: unknown;
+          generation?: unknown;
+          backend_admission_key?: unknown;
+          backend_run_id?: unknown;
+          backend_start_attempted?: unknown;
+          backend_submission_json?: unknown;
+          audited_terminal_json?: unknown;
+          request_json?: unknown;
+          due_at?: unknown;
+        }
+      | undefined;
+    if (
+      typeof row?.idempotency_key !== "string" ||
+      typeof row.request_hash !== "string" ||
+      typeof row.generation !== "string" ||
+      typeof row.request_json !== "string" ||
+      typeof row.due_at !== "number"
+    ) {
+      return undefined;
+    }
+    try {
+      return {
+        idempotencyKey: row.idempotency_key,
+        requestHash: row.request_hash,
+        generation: row.generation,
+        ...(typeof row.backend_admission_key === "string" && row.backend_admission_key
+          ? { backendAdmissionKey: row.backend_admission_key }
+          : {}),
+        ...(typeof row.backend_run_id === "string" && row.backend_run_id
+          ? { backendRunId: row.backend_run_id }
+          : {}),
+        ...(row.backend_start_attempted === 1 ? { backendStartAttempted: true } : {}),
+        ...(typeof row.backend_submission_json === "string" && row.backend_submission_json
+          ? {
+              backendSubmission: JSON.parse(
+                row.backend_submission_json,
+              ) as HermesBridgeBackendSubmission,
+            }
+          : {}),
+        ...(typeof row.audited_terminal_json === "string" && row.audited_terminal_json
+          ? {
+              auditedTerminal: JSON.parse(
+                row.audited_terminal_json,
+              ) as HermesBridgeAsyncTerminalState,
+            }
+          : {}),
+        request: JSON.parse(row.request_json) as HermesBridgeRequest,
+        dueAt: row.due_at,
+      };
+    } catch {
+      return undefined;
+    }
   }
 
   claimCleanup(
@@ -977,6 +1177,168 @@ export class SqliteHermesBridgeIdempotencyStore implements HermesBridgeIdempoten
             AND cleanup_owner = ?`,
       )
       .run(key, requestHash, generation, ownerId);
+  }
+
+  setCleanupAuditedTerminal(
+    key: string,
+    requestHash: string,
+    generation: string,
+    ownerId: string,
+    terminal: HermesBridgeAsyncTerminalState,
+  ): void {
+    if (
+      terminal.idempotencyKey !== key ||
+      terminal.requestHash !== requestHash ||
+      terminal.generation !== generation
+    ) {
+      throw new Error("Cleanup audited terminal identity does not match.");
+    }
+    const result = this.db
+      .prepare(
+        `UPDATE hermes_bridge_cleanup_obligations
+            SET audited_terminal_json = ?
+          WHERE idempotency_key = ?
+            AND request_hash = ?
+            AND generation = ?
+            AND cleanup_owner = ?
+            AND backend_run_id = ?`,
+      )
+      .run(JSON.stringify(terminal), key, requestHash, generation, ownerId, terminal.backendRunId);
+    if (result.changes !== 1) {
+      throw new Error("Cleanup audited terminal identity no longer matches.");
+    }
+  }
+
+  completeCleanup(
+    key: string,
+    requestHash: string,
+    generation: string,
+    ownerId: string,
+    terminal: HermesBridgeAsyncTerminalState,
+  ): void {
+    if (
+      terminal.idempotencyKey !== key ||
+      terminal.requestHash !== requestHash ||
+      terminal.generation !== generation
+    ) {
+      throw new Error("Cleanup terminal identity does not match the cleanup obligation.");
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const obligation = this.db
+        .prepare(
+          `SELECT backend_run_id
+             FROM hermes_bridge_cleanup_obligations
+            WHERE idempotency_key = ?
+              AND request_hash = ?
+              AND generation = ?
+              AND cleanup_owner = ?`,
+        )
+        .get(key, requestHash, generation, ownerId) as { backend_run_id?: unknown } | undefined;
+      if (
+        typeof obligation?.backend_run_id !== "string" ||
+        !obligation.backend_run_id ||
+        obligation.backend_run_id !== terminal.backendRunId
+      ) {
+        throw new Error("Cleanup obligation ownership or terminal identity no longer matches.");
+      }
+      const inserted = this.db
+        .prepare(
+          `INSERT INTO hermes_bridge_async_terminal
+             (
+               idempotency_key,
+               request_hash,
+               generation,
+               backend_run_id,
+               request_json,
+               output_json,
+               completed_at
+             )
+           VALUES (?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(idempotency_key) DO NOTHING`,
+        )
+        .run(
+          key,
+          requestHash,
+          generation,
+          terminal.backendRunId,
+          JSON.stringify(terminal.request),
+          JSON.stringify(terminal.output),
+          terminal.completedAt,
+        );
+      if (inserted.changes !== 1) {
+        const existing = this.db
+          .prepare(
+            `SELECT request_hash, generation, backend_run_id
+               FROM hermes_bridge_async_terminal
+              WHERE idempotency_key = ?`,
+          )
+          .get(key) as
+          | { request_hash?: unknown; generation?: unknown; backend_run_id?: unknown }
+          | undefined;
+        if (
+          existing?.request_hash !== requestHash ||
+          existing.generation !== generation ||
+          existing.backend_run_id !== terminal.backendRunId
+        ) {
+          throw new Error("Cleanup terminal tombstone conflicts with an earlier execution.");
+        }
+      }
+      const removed = this.db
+        .prepare(
+          `DELETE FROM hermes_bridge_cleanup_obligations
+            WHERE idempotency_key = ?
+              AND request_hash = ?
+              AND generation = ?
+              AND cleanup_owner = ?`,
+        )
+        .run(key, requestHash, generation, ownerId);
+      if (removed.changes !== 1) {
+        throw new Error("Cleanup obligation ownership was lost before terminal persistence.");
+      }
+      this.db.exec("COMMIT");
+    } catch (error) {
+      this.db.exec("ROLLBACK");
+      throw error;
+    }
+  }
+
+  getCleanupTerminal(key: string): HermesBridgeAsyncTerminalState | undefined {
+    const row = this.db
+      .prepare(
+        `SELECT request_hash, generation, backend_run_id, request_json, output_json, completed_at
+           FROM hermes_bridge_async_terminal
+          WHERE idempotency_key = ?`,
+      )
+      .get(key) as
+      | {
+          request_hash?: unknown;
+          generation?: unknown;
+          backend_run_id?: unknown;
+          request_json?: unknown;
+          output_json?: unknown;
+          completed_at?: unknown;
+        }
+      | undefined;
+    if (
+      typeof row?.request_hash !== "string" ||
+      typeof row.generation !== "string" ||
+      typeof row.backend_run_id !== "string" ||
+      typeof row.request_json !== "string" ||
+      typeof row.output_json !== "string" ||
+      typeof row.completed_at !== "number"
+    ) {
+      return undefined;
+    }
+    return {
+      idempotencyKey: key,
+      requestHash: row.request_hash,
+      generation: row.generation,
+      backendRunId: row.backend_run_id,
+      request: JSON.parse(row.request_json) as HermesBridgeRequest,
+      output: JSON.parse(row.output_json) as Record<string, unknown>,
+      completedAt: row.completed_at,
+    };
   }
 
   clearCleanup(key: string, requestHash: string, generation: string, ownerId?: string): void {

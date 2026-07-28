@@ -134,6 +134,34 @@ function requireReadonlyBrowserV2(
   };
 }
 
+function requireReadonlyBrowserLifecycleV2(
+  request: HermesBridgeRequest,
+  expectedAgentId: string,
+): void {
+  if (
+    request.protocolVersion !== "2.0" ||
+    !request.identity.delegationId ||
+    !request.identity.attemptId ||
+    !request.identity.contractFingerprint ||
+    request.routing.executorBackend !== "openclaw" ||
+    request.routing.executorProfile !== "browser-readonly" ||
+    request.routing.backendAgentId !== expectedAgentId ||
+    request.policy.externalEffectBudget !== 0 ||
+    request.policy.workspacePolicy !== "dedicated" ||
+    request.policy.sessionPolicy !== "ephemeral" ||
+    request.policy.credentialRefs.length !== 0 ||
+    request.allowedTools.length !== 1 ||
+    request.allowedTools[0] !== "browser.read" ||
+    request.requiresConfirmation ||
+    request.dryRun ||
+    !request.idempotencyKey
+  ) {
+    throw new Error(
+      "browser lifecycle control requires the fixed Protocol v2 read-only routing, ephemeral session, idempotency, and zero-effect policy.",
+    );
+  }
+}
+
 function requireZeroEffectAsyncV2(
   request: HermesBridgeRequest,
   expectedAgentId: string,
@@ -173,6 +201,7 @@ function requireZeroEffectAsyncV2(
         request.identity.project ?? "",
         request.identity.topicId ?? "",
         request.identity.contractFingerprint,
+        request.idempotencyKey,
       ].join("\0"),
     )
     .digest("hex")
@@ -291,12 +320,57 @@ function transcriptContainsToolActivity(messages: unknown[]): boolean {
   return false;
 }
 
+async function auditZeroEffectTerminal(
+  subagent: PluginRuntime["subagent"],
+  sessionKey: string,
+): Promise<{ resultText: string; transcriptMessageCount: number }> {
+  const transcript = await subagent.getSessionMessages({
+    sessionKey,
+    limit: 1_000,
+  });
+  if (transcript.messages.length >= 1_000) {
+    throw new Error("zero-effect async transcript reached the audit limit.");
+  }
+  if (transcriptContainsToolActivity(transcript.messages)) {
+    throw new Error("zero-effect async transcript contained tool activity.");
+  }
+  const resultText = finalAssistantText(transcript.messages);
+  if (resultText !== ZERO_EFFECT_ASYNC_RESULT) {
+    throw new Error("zero-effect async result did not match the fixed acceptance result.");
+  }
+  return {
+    resultText,
+    transcriptMessageCount: transcript.messages.length,
+  };
+}
+
 function remainingTimeoutMs(deadlineAt: number, capMs: number, operation: string): number {
   const remainingMs = deadlineAt - Date.now();
   if (remainingMs <= 0) {
     throw new Error(`OpenClaw read-only executor deadline expired before ${operation}.`);
   }
   return Math.max(1, Math.min(capMs, remainingMs));
+}
+
+class HermesBridgeDeadlineError extends Error {
+  constructor(label: string) {
+    super(`OpenClaw read-only executor timed out during ${label}.`);
+    this.name = "HermesBridgeDeadlineError";
+  }
+}
+
+function isDefinitiveBackendAdmissionRejection(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const code = "code" in error ? String(error.code).trim().toUpperCase() : "";
+  return new Set([
+    "INVALID_ARGUMENT",
+    "UNAUTHENTICATED",
+    "PERMISSION_DENIED",
+    "FAILED_PRECONDITION",
+    "NOT_FOUND",
+  ]).has(code);
 }
 
 async function withDeadline<T>(
@@ -311,7 +385,7 @@ async function withDeadline<T>(
       operation(),
       new Promise<T>((_resolve, reject) => {
         timer = setTimeout(() => {
-          reject(new Error(`OpenClaw read-only executor timed out during ${label}.`));
+          reject(new HermesBridgeDeadlineError(label));
         }, timeoutMs);
       }),
     ]);
@@ -496,7 +570,18 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
       const executionDeadlineAt = deadlineAt - cleanupReserveMs;
       const requestHash = hashHermesBridgeRequest(request);
       if (cleanupStore) {
-        mutateCleanupStore(() =>
+        const terminal = mutateCleanupStore(() =>
+          cleanupStore.getCleanupTerminal(validated.idempotencyKey),
+        );
+        if (terminal) {
+          if (terminal.requestHash !== requestHash) {
+            throw new Error(
+              "browser.read_snapshot terminal tombstone belongs to a different request.",
+            );
+          }
+          return structuredClone(terminal.output);
+        }
+        const registered = mutateCleanupStore(() =>
           cleanupStore.registerCleanup({
             idempotencyKey: validated.idempotencyKey,
             requestHash,
@@ -506,14 +591,28 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
             dueAt: deadlineAt + CLEANUP_SETTLE_BUFFER_MS,
           }),
         );
+        if (!registered) {
+          const racedTerminal = mutateCleanupStore(() =>
+            cleanupStore.getCleanupTerminal(validated.idempotencyKey),
+          );
+          if (!racedTerminal || racedTerminal.requestHash !== requestHash) {
+            throw new Error(
+              "browser.read_snapshot terminal replay was lost during cleanup registration.",
+            );
+          }
+          return structuredClone(racedTerminal.output);
+        }
       }
       let targetId: string | undefined;
       let browserOpenAttempted = false;
       let sessionAttempted = false;
       let runStarted = false;
       let runTerminationProven = false;
+      let backendRunId: string | undefined;
       let output:
         | {
+            bridgeStatus?: "succeeded";
+            bridgeSummary?: string;
             backendExecution: {
               executorBackend: "openclaw";
               backendRunId: string;
@@ -527,6 +626,9 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
               transcriptMessageCount: number;
               externalEffectBudget: 0;
               sideEffectsPerformed: false;
+              terminal?: boolean;
+              sessionCleaned?: boolean;
+              browserTabsCleaned?: boolean;
             };
             resultText: string;
           }
@@ -630,6 +732,7 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           executionDeadlineAt,
           "subagent start",
         );
+        backendRunId = run.runId;
         if (cleanupStore) {
           mutateCleanupStore(() =>
             cleanupStore.confirmCleanupBackendAdmission(
@@ -702,11 +805,104 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
       }
 
       const cleanupErrors: unknown[] = [];
+      let cleanupOwnerId: string | undefined;
+      let auditedTerminal:
+        | {
+            idempotencyKey: string;
+            requestHash: string;
+            generation: string;
+            backendRunId: string;
+            request: HermesBridgeRequest;
+            output: Record<string, unknown>;
+            completedAt: number;
+          }
+        | undefined;
+      if (
+        cleanupStore &&
+        runTerminationProven &&
+        backendRunId &&
+        ((output && !executionError) || executionError)
+      ) {
+        cleanupOwnerId = randomUUID();
+        try {
+          const claimed = mutateCleanupStore(() =>
+            cleanupStore.claimCleanup(validated.idempotencyKey, requestHash, cleanupGeneration, {
+              ownerId: cleanupOwnerId!,
+              leaseMs: 30_000,
+            }),
+          );
+          if (!claimed) {
+            throw new Error(
+              "browser.read_snapshot cleanup obligation could not be claimed for audited persistence.",
+            );
+          }
+          const auditedOutput: Record<string, unknown> =
+            output && !executionError
+              ? {
+                  ...output,
+                  bridgeStatus: "succeeded",
+                  bridgeSummary: "OpenClaw completed a real read-only browser snapshot.",
+                  evidence: {
+                    ...output.evidence,
+                    terminal: true,
+                    auditPassed: true,
+                    sessionCleaned: false,
+                    browserTabsCleaned: false,
+                  },
+                }
+              : {
+                  bridgeStatus: "failed",
+                  bridgeSummary:
+                    executionError instanceof Error
+                      ? executionError.message
+                      : "OpenClaw read-only browser execution failed.",
+                  backendExecution: {
+                    executorBackend: "openclaw",
+                    backendRunId,
+                    backendAgentId: agentId,
+                    sessionKey,
+                  },
+                  evidence: {
+                    requestedUrl: validated.url,
+                    externalEffectBudget: 0,
+                    sideEffectsPerformed: false,
+                    terminal: true,
+                    auditPassed: false,
+                    auditError:
+                      executionError instanceof Error
+                        ? executionError.message
+                        : "OpenClaw read-only browser execution failed.",
+                    sessionCleaned: false,
+                    browserTabsCleaned: false,
+                  },
+                };
+          auditedTerminal = {
+            idempotencyKey: validated.idempotencyKey,
+            requestHash,
+            generation: cleanupGeneration,
+            backendRunId,
+            request,
+            output: auditedOutput,
+            completedAt: Date.now(),
+          };
+          mutateCleanupStore(() =>
+            cleanupStore.setCleanupAuditedTerminal(
+              validated.idempotencyKey,
+              requestHash,
+              cleanupGeneration,
+              cleanupOwnerId!,
+              auditedTerminal!,
+            ),
+          );
+        } catch (error) {
+          cleanupErrors.push(error);
+        }
+      }
       const ambiguousCreation =
         (browserOpenAttempted && !targetId) ||
         (sessionAttempted && !runStarted) ||
         (runStarted && !runTerminationProven);
-      if (browserOpenAttempted && !targetId) {
+      if (cleanupErrors.length === 0 && browserOpenAttempted && !targetId) {
         for (const delayMs of [0, 250, 750]) {
           try {
             await waitForReconciliation(delayMs, deadlineAt);
@@ -717,7 +913,7 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           }
         }
       }
-      if (targetId) {
+      if (cleanupErrors.length === 0 && targetId) {
         try {
           await dispatchBrowserRequest(
             "DELETE",
@@ -728,7 +924,7 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           cleanupErrors.push(error);
         }
       }
-      if (sessionAttempted) {
+      if (cleanupErrors.length === 0 && sessionAttempted) {
         const deletionDelays = runStarted ? [0] : [0, 250, 750, 1_500];
         for (const delayMs of deletionDelays) {
           try {
@@ -745,7 +941,53 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         }
       }
       if (!ambiguousCreation && cleanupErrors.length === 0) {
-        if (cleanupStore) {
+        if (cleanupStore && cleanupOwnerId && auditedTerminal) {
+          const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+          if (!auditedEvidence) {
+            cleanupErrors.push(
+              new Error("browser.read_snapshot audited terminal is missing evidence."),
+            );
+          } else {
+            const terminalOutput = {
+              ...auditedTerminal.output,
+              evidence: {
+                ...auditedEvidence,
+                terminal: true,
+                sessionCleaned: true,
+                browserTabsCleaned: true,
+              },
+            };
+            try {
+              mutateCleanupStore(() =>
+                cleanupStore.completeCleanup(
+                  validated.idempotencyKey,
+                  requestHash,
+                  cleanupGeneration,
+                  cleanupOwnerId,
+                  {
+                    ...auditedTerminal,
+                    output: terminalOutput,
+                  },
+                ),
+              );
+              if (output && !executionError) {
+                output = {
+                  ...output,
+                  bridgeStatus: "succeeded",
+                  bridgeSummary: "OpenClaw completed a real read-only browser snapshot.",
+                  evidence: {
+                    ...output.evidence,
+                    terminal: true,
+                    sessionCleaned: true,
+                    browserTabsCleaned: true,
+                  },
+                };
+              }
+            } catch (error) {
+              cleanupErrors.push(error);
+            }
+          }
+        } else if (cleanupStore) {
           mutateCleanupStore(() =>
             cleanupStore.clearCleanup(validated.idempotencyKey, requestHash, cleanupGeneration),
           );
@@ -766,6 +1008,464 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
     },
   },
   {
+    taskId: "openclaw.browser.read_snapshot_poll",
+    description: "Poll and finalize one exact admitted read-only browser snapshot execution.",
+    dangerous: false,
+    mockOnly: false,
+    requiredTools: ["browser.read"],
+    async execute({ request, config, subagent, cleanupStore }) {
+      if (!cleanupStore) {
+        throw new Error("browser snapshot poll requires the durable cleanup store.");
+      }
+      requireReadonlyBrowserLifecycleV2(request, config.readonlyBrowserAgentId);
+      const input = normalizeRequestInput(request);
+      const startIdempotencyKey = readString(input, "startIdempotencyKey")?.trim();
+      const requestedBackendRunId = readString(input, "backendRunId")?.trim();
+      if (!startIdempotencyKey || !requestedBackendRunId) {
+        throw new Error(
+          "browser snapshot poll requires input.startIdempotencyKey and input.backendRunId.",
+        );
+      }
+      const obligation = mutateCleanupStore(() => cleanupStore.getCleanup(startIdempotencyKey));
+      if (!obligation) {
+        const terminal = mutateCleanupStore(() =>
+          cleanupStore.getCleanupTerminal(startIdempotencyKey),
+        );
+        if (
+          terminal &&
+          terminal.request.taskId === "openclaw.browser.read_snapshot" &&
+          terminal.backendRunId === requestedBackendRunId
+        ) {
+          assertSameExecutionIdentity(request, terminal.request);
+          return structuredClone(terminal.output);
+        }
+      }
+      if (
+        !obligation ||
+        obligation.request.taskId !== "openclaw.browser.read_snapshot" ||
+        obligation.backendRunId !== requestedBackendRunId ||
+        !obligation.backendSubmission
+      ) {
+        throw new Error("browser snapshot poll could not resolve the exact admitted start run.");
+      }
+      assertSameExecutionIdentity(request, obligation.request);
+      const validatedStart = requireReadonlyBrowserV2(
+        obligation.request,
+        config.readonlyBrowserAgentId,
+      );
+      const { sessionKey, tabLabel } = scopedReadonlyResources(
+        validatedStart,
+        obligation.generation,
+        config.readonlyBrowserAgentId,
+      );
+      if (obligation.backendSubmission.sessionKey !== sessionKey) {
+        throw new Error("browser snapshot poll resolved a different backend session.");
+      }
+      const cleanupOwnerId = randomUUID();
+      if (
+        !mutateCleanupStore(() =>
+          cleanupStore.claimCleanup(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            { ownerId: cleanupOwnerId, leaseMs: 35_000 },
+          ),
+        )
+      ) {
+        throw new HermesBridgeCleanupPendingError();
+      }
+      try {
+        const deadlineAt = Date.now() + 30_000;
+        let auditedTerminal = obligation.auditedTerminal;
+        if (!auditedTerminal) {
+          const wait = await withDeadline(
+            () =>
+              subagent.waitForRun({
+                runId: requestedBackendRunId,
+                timeoutMs: 1,
+              }),
+            deadlineAt,
+            "browser snapshot poll",
+          );
+          if (!waitResultIsTerminal(wait)) {
+            mutateCleanupStore(() =>
+              cleanupStore.releaseCleanup(
+                obligation.idempotencyKey,
+                obligation.requestHash,
+                obligation.generation,
+                cleanupOwnerId,
+              ),
+            );
+            return {
+              bridgeStatus: "running",
+              bridgeSummary: "OpenClaw read-only browser reviewer is still running.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId: requestedBackendRunId,
+                backendAgentId: config.readonlyBrowserAgentId,
+                sessionKey,
+              },
+              evidence: {
+                requestedUrl: validatedStart.url,
+                externalEffectBudget: 0,
+                sideEffectsPerformed: false,
+                terminal: false,
+              },
+            };
+          }
+
+          let auditedOutput: Record<string, unknown>;
+          if (wait.status === "ok") {
+            try {
+              const transcript = await withDeadline(
+                () => subagent.getSessionMessages({ sessionKey, limit: 1_000 }),
+                deadlineAt,
+                "browser poll transcript",
+              );
+              if (transcript.messages.length >= 1_000) {
+                throw new Error("browser snapshot transcript reached the audit limit.");
+              }
+              if (transcriptContainsToolActivity(transcript.messages)) {
+                throw new Error("browser snapshot transcript contained tool activity.");
+              }
+              const resultText = finalAssistantText(transcript.messages);
+              const message = obligation.backendSubmission.message;
+              const capturedEvidence = asRecord(
+                JSON.parse(message.slice(message.lastIndexOf("\n") + 1)),
+              );
+              if (
+                !capturedEvidence ||
+                typeof capturedEvidence.url !== "string" ||
+                typeof capturedEvidence.title !== "string" ||
+                typeof capturedEvidence.snapshotExcerpt !== "string" ||
+                typeof capturedEvidence.targetId !== "string"
+              ) {
+                throw new Error("browser snapshot poll is missing captured evidence.");
+              }
+              validateReviewerResult(resultText, {
+                url: capturedEvidence.url,
+                title: capturedEvidence.title,
+                snapshotExcerpt: capturedEvidence.snapshotExcerpt,
+              });
+              auditedOutput = {
+                bridgeStatus: "succeeded",
+                bridgeSummary: "OpenClaw completed a real read-only browser snapshot.",
+                backendExecution: {
+                  executorBackend: "openclaw" as const,
+                  backendRunId: requestedBackendRunId,
+                  backendAgentId: config.readonlyBrowserAgentId,
+                  sessionKey,
+                },
+                evidence: {
+                  requestedUrl: capturedEvidence.url,
+                  browserTargetId: capturedEvidence.targetId,
+                  browserSnapshotChars: capturedEvidence.snapshotExcerpt.length,
+                  transcriptMessageCount: transcript.messages.length,
+                  externalEffectBudget: 0,
+                  sideEffectsPerformed: false,
+                  terminal: true,
+                  auditPassed: true,
+                  sessionCleaned: false,
+                  browserTabsCleaned: false,
+                },
+                resultText,
+              };
+            } catch (error) {
+              const auditError =
+                error instanceof Error
+                  ? error.message
+                  : "browser snapshot transcript audit failed.";
+              auditedOutput = {
+                bridgeStatus: "failed",
+                bridgeSummary: auditError,
+                backendExecution: {
+                  executorBackend: "openclaw" as const,
+                  backendRunId: requestedBackendRunId,
+                  backendAgentId: config.readonlyBrowserAgentId,
+                  sessionKey,
+                },
+                evidence: {
+                  requestedUrl: validatedStart.url,
+                  externalEffectBudget: 0,
+                  sideEffectsPerformed: false,
+                  terminal: true,
+                  auditPassed: false,
+                  auditError,
+                  sessionCleaned: false,
+                  browserTabsCleaned: false,
+                },
+              };
+            }
+          } else {
+            auditedOutput = {
+              bridgeStatus: "failed",
+              bridgeSummary:
+                wait.error || `OpenClaw browser reviewer ended with status=${wait.status}.`,
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId: requestedBackendRunId,
+                backendAgentId: config.readonlyBrowserAgentId,
+                sessionKey,
+              },
+              evidence: {
+                requestedUrl: validatedStart.url,
+                externalEffectBudget: 0,
+                sideEffectsPerformed: false,
+                terminal: true,
+                sessionCleaned: false,
+                browserTabsCleaned: false,
+              },
+            };
+          }
+          auditedTerminal = {
+            idempotencyKey: obligation.idempotencyKey,
+            requestHash: obligation.requestHash,
+            generation: obligation.generation,
+            backendRunId: requestedBackendRunId,
+            request: obligation.request,
+            output: auditedOutput,
+            completedAt: Date.now(),
+          };
+          mutateCleanupStore(() =>
+            cleanupStore.setCleanupAuditedTerminal(
+              obligation.idempotencyKey,
+              obligation.requestHash,
+              obligation.generation,
+              cleanupOwnerId,
+              auditedTerminal!,
+            ),
+          );
+        }
+        if (
+          auditedTerminal.idempotencyKey !== obligation.idempotencyKey ||
+          auditedTerminal.requestHash !== obligation.requestHash ||
+          auditedTerminal.generation !== obligation.generation ||
+          auditedTerminal.backendRunId !== requestedBackendRunId
+        ) {
+          throw new Error("browser snapshot audited terminal identity does not match.");
+        }
+        await deleteCorrelatedTabs(tabLabel, deadlineAt);
+        await withDeadline(
+          () => subagent.deleteSession({ sessionKey }),
+          deadlineAt,
+          "browser poll session cleanup",
+        );
+        const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!auditedEvidence) {
+          throw new Error("browser snapshot audited terminal is missing evidence.");
+        }
+        const output = {
+          ...auditedTerminal.output,
+          evidence: {
+            ...auditedEvidence,
+            sessionCleaned: true,
+            browserTabsCleaned: true,
+          },
+        };
+        mutateCleanupStore(() =>
+          cleanupStore.completeCleanup(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            cleanupOwnerId,
+            {
+              idempotencyKey: obligation.idempotencyKey,
+              requestHash: obligation.requestHash,
+              generation: obligation.generation,
+              backendRunId: requestedBackendRunId,
+              request: obligation.request,
+              output,
+              completedAt: auditedTerminal!.completedAt,
+            },
+          ),
+        );
+        return output;
+      } catch (error) {
+        mutateCleanupStore(() =>
+          cleanupStore.releaseCleanup(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            cleanupOwnerId,
+          ),
+        );
+        throw error;
+      }
+    },
+  },
+  {
+    taskId: "openclaw.browser.read_snapshot_cancel",
+    description:
+      "Abort and clean up one exact read-only browser snapshot execution without starting new work.",
+    dangerous: false,
+    mockOnly: false,
+    requiredTools: ["browser.read"],
+    async execute({ request, config, subagent, cleanupStore }) {
+      if (!cleanupStore) {
+        throw new Error("browser snapshot cancellation requires the durable cleanup store.");
+      }
+      requireReadonlyBrowserLifecycleV2(request, config.readonlyBrowserAgentId);
+      const input = normalizeRequestInput(request);
+      const startIdempotencyKey = readString(input, "startIdempotencyKey")?.trim();
+      const requestedBackendRunId = readString(input, "backendRunId")?.trim();
+      if (!startIdempotencyKey || !requestedBackendRunId) {
+        throw new Error(
+          "browser snapshot cancellation requires input.startIdempotencyKey and input.backendRunId.",
+        );
+      }
+      const obligation = mutateCleanupStore(() => cleanupStore.getCleanup(startIdempotencyKey));
+      if (!obligation) {
+        const terminal = mutateCleanupStore(() =>
+          cleanupStore.getCleanupTerminal(startIdempotencyKey),
+        );
+        if (
+          terminal &&
+          terminal.request.taskId === "openclaw.browser.read_snapshot" &&
+          terminal.backendRunId === requestedBackendRunId
+        ) {
+          assertSameExecutionIdentity(request, terminal.request);
+          return structuredClone(terminal.output);
+        }
+      }
+      if (
+        !obligation ||
+        obligation.request.taskId !== "openclaw.browser.read_snapshot" ||
+        obligation.backendRunId !== requestedBackendRunId ||
+        !obligation.backendSubmission
+      ) {
+        throw new Error(
+          "browser snapshot cancellation could not resolve the exact admitted start run.",
+        );
+      }
+      assertSameExecutionIdentity(request, obligation.request);
+      const validatedStart = requireReadonlyBrowserV2(
+        obligation.request,
+        config.readonlyBrowserAgentId,
+      );
+      const { sessionKey, tabLabel } = scopedReadonlyResources(
+        validatedStart,
+        obligation.generation,
+        config.readonlyBrowserAgentId,
+      );
+      if (obligation.backendSubmission.sessionKey !== sessionKey) {
+        throw new Error("browser snapshot cancellation resolved a different backend session.");
+      }
+      const cleanupOwnerId = randomUUID();
+      if (
+        !mutateCleanupStore(() =>
+          cleanupStore.claimCleanup(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            { ownerId: cleanupOwnerId, leaseMs: 35_000 },
+          ),
+        )
+      ) {
+        throw new HermesBridgeCleanupPendingError();
+      }
+      try {
+        const deadlineAt = Date.now() + 30_000;
+        let auditedTerminal = obligation.auditedTerminal;
+        const existingEvidence = asRecord(auditedTerminal?.output.evidence);
+        const auditedIdentityMatches =
+          auditedTerminal?.request.taskId === "openclaw.browser.read_snapshot" &&
+          auditedTerminal.backendRunId === requestedBackendRunId;
+        if (auditedTerminal && (!existingEvidence || !auditedIdentityMatches)) {
+          throw new Error("browser cancellation audited terminal identity is invalid.");
+        }
+        if (!auditedTerminal) {
+          auditedTerminal = {
+            idempotencyKey: obligation.idempotencyKey,
+            requestHash: obligation.requestHash,
+            generation: obligation.generation,
+            backendRunId: requestedBackendRunId,
+            request: obligation.request,
+            output: {
+              bridgeStatus: "blocked",
+              bridgeSummary: "OpenClaw is cancelling the read-only browser run.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId: requestedBackendRunId,
+                backendAgentId: config.readonlyBrowserAgentId,
+                sessionKey,
+              },
+              evidence: {
+                requestedUrl: validatedStart.url,
+                externalEffectBudget: 0,
+                sideEffectsPerformed: false,
+                terminal: true,
+                cancellationRequested: true,
+                terminationProven: true,
+                sessionCleaned: false,
+                browserTabsCleaned: false,
+              },
+            },
+            completedAt: Date.now(),
+          };
+          mutateCleanupStore(() =>
+            cleanupStore.setCleanupAuditedTerminal(
+              obligation.idempotencyKey,
+              obligation.requestHash,
+              obligation.generation,
+              cleanupOwnerId,
+              auditedTerminal!,
+            ),
+          );
+        }
+        await deleteCorrelatedTabs(tabLabel, deadlineAt);
+        await withDeadline(
+          () => subagent.deleteSession({ sessionKey }),
+          deadlineAt,
+          "browser cancellation session cleanup",
+        );
+        const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!auditedEvidence) {
+          throw new Error("browser cancellation audited terminal is missing evidence.");
+        }
+        const output = {
+          ...auditedTerminal.output,
+          bridgeSummary:
+            auditedTerminal === obligation.auditedTerminal
+              ? auditedTerminal.output.bridgeSummary
+              : "OpenClaw aborted the read-only browser run and cleaned its resources.",
+          evidence: {
+            ...auditedEvidence,
+            sessionCleaned: true,
+            browserTabsCleaned: true,
+          },
+        };
+        mutateCleanupStore(() =>
+          cleanupStore.completeCleanup(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            cleanupOwnerId,
+            {
+              idempotencyKey: obligation.idempotencyKey,
+              requestHash: obligation.requestHash,
+              generation: obligation.generation,
+              backendRunId: requestedBackendRunId,
+              request: obligation.request,
+              output,
+              completedAt: auditedTerminal.completedAt,
+            },
+          ),
+        );
+        return output;
+      } catch (error) {
+        mutateCleanupStore(() =>
+          cleanupStore.releaseCleanup(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            cleanupOwnerId,
+          ),
+        );
+        throw error;
+      }
+    },
+  },
+  {
     taskId: "openclaw.agent.zero_effect_async_start",
     description:
       "Start a real asynchronous OpenClaw agent run with no tools, credentials, or external effects.",
@@ -777,62 +1477,166 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         throw new Error("zero-effect async start requires the durable cleanup store.");
       }
       const validated = requireZeroEffectAsyncV2(request, config.readonlyBrowserAgentId);
-      const generation = randomUUID();
-      const generationHash = createHash("sha256").update(generation).digest("hex").slice(0, 16);
-      const backendAdmissionKey = `${validated.idempotencyKey}:${generationHash}`;
       const requestHash = hashHermesBridgeRequest(request);
-      const backendSubmission = {
-        sessionKey: validated.sessionKey,
-        toolsAllow: [] as [],
-        disableTools: true as const,
-        message: [
-          "Complete this zero-effect asynchronous acceptance task.",
-          "Do not call tools, access credentials, or perform external actions.",
-          `Return exactly: ${ZERO_EFFECT_ASYNC_RESULT}`,
-        ].join("\n"),
-        extraSystemPrompt:
-          "You are a zero-effect acceptance worker. Call no tools and return only the exact requested JSON.",
-        lane: `hermes-bridge:${request.identity.delegationId}`,
-        lightContext: true as const,
-        deliver: false as const,
-      };
-      mutateCleanupStore(() =>
-        cleanupStore.registerCleanup({
-          idempotencyKey: validated.idempotencyKey,
-          requestHash,
-          generation,
-          backendAdmissionKey,
-          request,
-          dueAt: Date.now() + config.maxLiveRuntimeSeconds * 1_000 + CLEANUP_SETTLE_BUFFER_MS,
-        }),
+      const terminal = mutateCleanupStore(() =>
+        cleanupStore.getCleanupTerminal(validated.idempotencyKey),
       );
-      mutateCleanupStore(() =>
-        cleanupStore.setCleanupBackendSubmission(
-          validated.idempotencyKey,
-          requestHash,
-          generation,
-          backendAdmissionKey,
-          backendSubmission,
-        ),
-      );
+      if (terminal) {
+        if (
+          terminal.requestHash !== requestHash ||
+          terminal.request.taskId !== "openclaw.agent.zero_effect_async_start"
+        ) {
+          throw new Error("zero-effect async start tombstone belongs to another request.");
+        }
+        return structuredClone(terminal.output);
+      }
+      let obligation = mutateCleanupStore(() => cleanupStore.getCleanup(validated.idempotencyKey));
+      let newlyRegisteredAdmission = false;
+      if (!obligation) {
+        const generation = randomUUID();
+        const generationHash = createHash("sha256").update(generation).digest("hex").slice(0, 16);
+        const backendAdmissionKey = `${validated.idempotencyKey}:${generationHash}`;
+        const backendSubmission = {
+          sessionKey: validated.sessionKey,
+          toolsAllow: [] as [],
+          disableTools: true as const,
+          message: [
+            "Complete this zero-effect asynchronous acceptance task.",
+            "Do not call tools, access credentials, or perform external actions.",
+            `Return exactly: ${ZERO_EFFECT_ASYNC_RESULT}`,
+          ].join("\n"),
+          extraSystemPrompt:
+            "You are a zero-effect acceptance worker. Call no tools and return only the exact requested JSON.",
+          lane: `hermes-bridge:${request.identity.delegationId}`,
+          lightContext: true as const,
+          deliver: false as const,
+        };
+        const registered = mutateCleanupStore(() =>
+          cleanupStore.registerCleanup({
+            idempotencyKey: validated.idempotencyKey,
+            requestHash,
+            generation,
+            backendAdmissionKey,
+            request,
+            dueAt: Date.now() + config.maxLiveRuntimeSeconds * 1_000 + CLEANUP_SETTLE_BUFFER_MS,
+          }),
+        );
+        if (!registered) {
+          const racedTerminal = mutateCleanupStore(() =>
+            cleanupStore.getCleanupTerminal(validated.idempotencyKey),
+          );
+          if (
+            !racedTerminal ||
+            racedTerminal.requestHash !== requestHash ||
+            racedTerminal.request.taskId !== "openclaw.agent.zero_effect_async_start"
+          ) {
+            throw new Error(
+              "zero-effect async terminal replay was lost during cleanup registration.",
+            );
+          }
+          return structuredClone(racedTerminal.output);
+        }
+        newlyRegisteredAdmission = true;
+        mutateCleanupStore(() =>
+          cleanupStore.setCleanupBackendSubmission(
+            validated.idempotencyKey,
+            requestHash,
+            generation,
+            backendAdmissionKey,
+            backendSubmission,
+          ),
+        );
+        mutateCleanupStore(() =>
+          cleanupStore.markCleanupBackendStartAttempted(
+            validated.idempotencyKey,
+            requestHash,
+            generation,
+            backendAdmissionKey,
+          ),
+        );
+        obligation = mutateCleanupStore(() => cleanupStore.getCleanup(validated.idempotencyKey));
+      }
+      if (
+        !obligation ||
+        obligation.requestHash !== requestHash ||
+        obligation.request.taskId !== "openclaw.agent.zero_effect_async_start" ||
+        !obligation.backendAdmissionKey ||
+        !obligation.backendSubmission
+      ) {
+        throw new Error("zero-effect async start cannot reconcile its durable admission.");
+      }
+      assertSameExecutionIdentity(request, obligation.request);
+      if (obligation.backendRunId) {
+        return {
+          bridgeStatus: "accepted",
+          bridgeSummary: "OpenClaw reconciled the zero-effect asynchronous run.",
+          backendExecution: {
+            executorBackend: "openclaw" as const,
+            backendRunId: obligation.backendRunId,
+            backendAgentId: validated.agentId,
+            sessionKey: obligation.backendSubmission.sessionKey,
+          },
+          evidence: {
+            externalEffectBudget: 0,
+            sideEffectsPerformed: false,
+            toolsAllowed: [],
+            terminal: false,
+          },
+        };
+      }
       mutateCleanupStore(() =>
         cleanupStore.markCleanupBackendStartAttempted(
-          validated.idempotencyKey,
-          requestHash,
-          generation,
-          backendAdmissionKey,
+          obligation.idempotencyKey,
+          obligation.requestHash,
+          obligation.generation,
+          obligation.backendAdmissionKey!,
         ),
       );
-      const run = await subagent.run({
-        ...backendSubmission,
-        idempotencyKey: backendAdmissionKey,
-      });
+      const admissionDeadlineAt =
+        Date.now() + Math.min(config.maxLiveRuntimeSeconds * 1_000, 30_000);
+      let run: { runId: string };
+      try {
+        run = await withDeadline(
+          () =>
+            subagent.run({
+              ...obligation.backendSubmission!,
+              idempotencyKey: obligation.backendAdmissionKey!,
+            }),
+          admissionDeadlineAt,
+          "zero-effect async backend admission",
+        );
+      } catch (error) {
+        if (newlyRegisteredAdmission && isDefinitiveBackendAdmissionRejection(error)) {
+          mutateCleanupStore(() =>
+            cleanupStore.clearCleanup(
+              obligation.idempotencyKey,
+              obligation.requestHash,
+              obligation.generation,
+            ),
+          );
+          throw error;
+        }
+        return {
+          bridgeStatus: "running",
+          bridgeSummary:
+            error instanceof Error
+              ? error.message
+              : "OpenClaw zero-effect admission remains pending.",
+          evidence: {
+            externalEffectBudget: 0,
+            sideEffectsPerformed: false,
+            toolsAllowed: [],
+            terminal: false,
+            admissionPending: true,
+          },
+        };
+      }
       mutateCleanupStore(() =>
         cleanupStore.confirmCleanupBackendAdmission(
           validated.idempotencyKey,
           requestHash,
-          generation,
-          backendAdmissionKey,
+          obligation.generation,
+          obligation.backendAdmissionKey!,
           run.runId,
         ),
       );
@@ -874,6 +1678,19 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         );
       }
       const obligation = mutateCleanupStore(() => cleanupStore.getCleanup(startIdempotencyKey));
+      if (!obligation) {
+        const terminal = mutateCleanupStore(() =>
+          cleanupStore.getCleanupTerminal(startIdempotencyKey),
+        );
+        if (
+          terminal &&
+          terminal.request.taskId === "openclaw.agent.zero_effect_async_start" &&
+          terminal.backendRunId === requestedBackendRunId
+        ) {
+          assertSameExecutionIdentity(request, terminal.request);
+          return structuredClone(terminal.output);
+        }
+      }
       if (
         !obligation ||
         obligation.request.taskId !== "openclaw.agent.zero_effect_async_start" ||
@@ -890,29 +1707,73 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
             obligation.idempotencyKey,
             obligation.requestHash,
             obligation.generation,
-            { ownerId: cleanupOwnerId, leaseMs: 30_000 },
+            { ownerId: cleanupOwnerId, leaseMs: 35_000 },
           ),
         )
       ) {
         throw new HermesBridgeCleanupPendingError();
       }
       try {
-        const wait = await subagent.waitForRun({
-          runId: requestedBackendRunId,
-          timeoutMs: 1,
-        });
-        if (!waitResultIsTerminal(wait)) {
-          mutateCleanupStore(() =>
-            cleanupStore.releaseCleanup(
-              obligation.idempotencyKey,
-              obligation.requestHash,
-              obligation.generation,
-              cleanupOwnerId,
-            ),
+        const deadlineAt = Date.now() + 30_000;
+        let auditedTerminal = obligation.auditedTerminal;
+        if (!auditedTerminal) {
+          const wait = await withDeadline(
+            () =>
+              subagent.waitForRun({
+                runId: requestedBackendRunId,
+                timeoutMs: 1,
+              }),
+            deadlineAt,
+            "zero-effect async poll",
           );
-          return {
-            bridgeStatus: "running",
-            bridgeSummary: "OpenClaw zero-effect asynchronous run is still running.",
+          if (!waitResultIsTerminal(wait)) {
+            mutateCleanupStore(() =>
+              cleanupStore.releaseCleanup(
+                obligation.idempotencyKey,
+                obligation.requestHash,
+                obligation.generation,
+                cleanupOwnerId,
+              ),
+            );
+            return {
+              bridgeStatus: "running",
+              bridgeSummary: "OpenClaw zero-effect asynchronous run is still running.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId: requestedBackendRunId,
+                backendAgentId: config.readonlyBrowserAgentId,
+                sessionKey: obligation.backendSubmission.sessionKey,
+              },
+              evidence: {
+                externalEffectBudget: 0,
+                sideEffectsPerformed: false,
+                toolsAllowed: [],
+                terminal: false,
+              },
+            };
+          }
+          let audit: { resultText: string; transcriptMessageCount: number } | undefined;
+          let auditError: string | undefined;
+          if (wait.status === "ok") {
+            try {
+              audit = await withDeadline(
+                () => auditZeroEffectTerminal(subagent, obligation.backendSubmission!.sessionKey),
+                deadlineAt,
+                "zero-effect async transcript audit",
+              );
+            } catch (error) {
+              auditError =
+                error instanceof Error
+                  ? error.message
+                  : "zero-effect async transcript audit failed.";
+            }
+          }
+          const auditPassed = wait.status === "ok" && Boolean(audit);
+          const auditedOutput = {
+            bridgeStatus: auditPassed ? "succeeded" : "failed",
+            bridgeSummary: auditPassed
+              ? "OpenClaw zero-effect asynchronous run completed."
+              : auditError || `OpenClaw zero-effect async run ended with status=${wait.status}.`,
             backendExecution: {
               executorBackend: "openclaw" as const,
               backendRunId: requestedBackendRunId,
@@ -923,57 +1784,71 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
               externalEffectBudget: 0,
               sideEffectsPerformed: false,
               toolsAllowed: [],
-              terminal: false,
+              terminal: true,
+              sessionCleaned: false,
+              auditPassed,
+              ...(audit ? { transcriptMessageCount: audit.transcriptMessageCount } : {}),
+              ...(wait.status === "ok" ? {} : { terminalStatus: wait.status }),
+              ...(auditError ? { auditError } : {}),
             },
+            ...(audit ? { resultText: audit.resultText } : {}),
           };
+          auditedTerminal = {
+            idempotencyKey: obligation.idempotencyKey,
+            requestHash: obligation.requestHash,
+            generation: obligation.generation,
+            backendRunId: requestedBackendRunId,
+            request: obligation.request,
+            output: auditedOutput,
+            completedAt: Date.now(),
+          };
+          mutateCleanupStore(() =>
+            cleanupStore.setCleanupAuditedTerminal(
+              obligation.idempotencyKey,
+              obligation.requestHash,
+              obligation.generation,
+              cleanupOwnerId,
+              auditedTerminal!,
+            ),
+          );
         }
-        if (wait.status !== "ok") {
-          throw new Error(wait.error || `zero-effect async run ended with status=${wait.status}.`);
+        await withDeadline(
+          () =>
+            subagent.deleteSession({
+              sessionKey: obligation.backendSubmission!.sessionKey,
+            }),
+          deadlineAt,
+          "zero-effect async session cleanup",
+        );
+        const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!auditedEvidence) {
+          throw new Error("zero-effect async audited terminal is missing evidence.");
         }
-        const transcript = await subagent.getSessionMessages({
-          sessionKey: obligation.backendSubmission.sessionKey,
-          limit: 1_000,
-        });
-        if (transcript.messages.length >= 1_000) {
-          throw new Error("zero-effect async transcript reached the audit limit.");
-        }
-        if (transcriptContainsToolActivity(transcript.messages)) {
-          throw new Error("zero-effect async transcript contained tool activity.");
-        }
-        const resultText = finalAssistantText(transcript.messages);
-        if (resultText !== ZERO_EFFECT_ASYNC_RESULT) {
-          throw new Error("zero-effect async result did not match the fixed acceptance result.");
-        }
-        await subagent.deleteSession({
-          sessionKey: obligation.backendSubmission.sessionKey,
-        });
+        const output = {
+          ...auditedTerminal.output,
+          evidence: {
+            ...auditedEvidence,
+            sessionCleaned: true,
+          },
+        };
         mutateCleanupStore(() =>
-          cleanupStore.clearCleanup(
+          cleanupStore.completeCleanup(
             obligation.idempotencyKey,
             obligation.requestHash,
             obligation.generation,
             cleanupOwnerId,
+            {
+              idempotencyKey: obligation.idempotencyKey,
+              requestHash: obligation.requestHash,
+              generation: obligation.generation,
+              backendRunId: requestedBackendRunId,
+              request: obligation.request,
+              output,
+              completedAt: auditedTerminal.completedAt,
+            },
           ),
         );
-        return {
-          bridgeStatus: "succeeded",
-          bridgeSummary: "OpenClaw zero-effect asynchronous run completed and was cleaned up.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId: requestedBackendRunId,
-            backendAgentId: config.readonlyBrowserAgentId,
-            sessionKey: obligation.backendSubmission.sessionKey,
-          },
-          evidence: {
-            externalEffectBudget: 0,
-            sideEffectsPerformed: false,
-            toolsAllowed: [],
-            terminal: true,
-            sessionCleaned: true,
-            transcriptMessageCount: transcript.messages.length,
-          },
-          resultText,
-        };
+        return output;
       } catch (error) {
         mutateCleanupStore(() =>
           cleanupStore.releaseCleanup(
@@ -1007,6 +1882,19 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         );
       }
       const obligation = mutateCleanupStore(() => cleanupStore.getCleanup(startIdempotencyKey));
+      if (!obligation) {
+        const terminal = mutateCleanupStore(() =>
+          cleanupStore.getCleanupTerminal(startIdempotencyKey),
+        );
+        if (
+          terminal &&
+          terminal.request.taskId === "openclaw.agent.zero_effect_async_start" &&
+          terminal.backendRunId === requestedBackendRunId
+        ) {
+          assertSameExecutionIdentity(request, terminal.request);
+          return structuredClone(terminal.output);
+        }
+      }
       if (
         !obligation ||
         obligation.request.taskId !== "openclaw.agent.zero_effect_async_start" ||
@@ -1030,39 +1918,96 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         throw new HermesBridgeCleanupPendingError();
       }
       try {
+        const deadlineAt = Date.now() + 30_000;
+        let auditedTerminal = obligation.auditedTerminal;
+        const existingEvidence = asRecord(auditedTerminal?.output.evidence);
+        const auditedIdentityMatches =
+          auditedTerminal?.request.taskId === "openclaw.agent.zero_effect_async_start" &&
+          auditedTerminal.backendRunId === requestedBackendRunId;
+        if (auditedTerminal && (!existingEvidence || !auditedIdentityMatches)) {
+          throw new Error("zero-effect cancellation audited terminal identity is invalid.");
+        }
+        if (!auditedTerminal) {
+          auditedTerminal = {
+            idempotencyKey: obligation.idempotencyKey,
+            requestHash: obligation.requestHash,
+            generation: obligation.generation,
+            backendRunId: requestedBackendRunId,
+            request: obligation.request,
+            output: {
+              bridgeStatus: "blocked",
+              bridgeSummary: "OpenClaw is cancelling the zero-effect asynchronous run.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId: requestedBackendRunId,
+                backendAgentId: config.readonlyBrowserAgentId,
+                sessionKey: obligation.backendSubmission.sessionKey,
+              },
+              evidence: {
+                externalEffectBudget: 0,
+                sideEffectsPerformed: false,
+                toolsAllowed: [],
+                terminal: true,
+                cancellationRequested: true,
+                terminationProven: true,
+                sessionCleaned: false,
+              },
+            },
+            completedAt: Date.now(),
+          };
+          mutateCleanupStore(() =>
+            cleanupStore.setCleanupAuditedTerminal(
+              obligation.idempotencyKey,
+              obligation.requestHash,
+              obligation.generation,
+              cleanupOwnerId,
+              auditedTerminal!,
+            ),
+          );
+        }
         // sessions.delete aborts active runs and only resolves after the
         // gateway has proven the owned session can be removed.
-        await subagent.deleteSession({
-          sessionKey: obligation.backendSubmission.sessionKey,
-        });
+        await withDeadline(
+          () =>
+            subagent.deleteSession({
+              sessionKey: obligation.backendSubmission!.sessionKey,
+            }),
+          deadlineAt,
+          "zero-effect cancellation session cleanup",
+        );
+        const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!auditedEvidence) {
+          throw new Error("zero-effect cancellation audited terminal is missing evidence.");
+        }
+        const output = {
+          ...auditedTerminal.output,
+          bridgeSummary:
+            auditedTerminal === obligation.auditedTerminal
+              ? auditedTerminal.output.bridgeSummary
+              : "OpenClaw aborted the zero-effect asynchronous run and cleaned its session.",
+          evidence: {
+            ...auditedEvidence,
+            sessionCleaned: true,
+          },
+        };
         mutateCleanupStore(() =>
-          cleanupStore.clearCleanup(
+          cleanupStore.completeCleanup(
             obligation.idempotencyKey,
             obligation.requestHash,
             obligation.generation,
             cleanupOwnerId,
+            {
+              idempotencyKey: obligation.idempotencyKey,
+              requestHash: obligation.requestHash,
+              generation: obligation.generation,
+              backendRunId: requestedBackendRunId,
+              request: obligation.request,
+              output,
+              completedAt: auditedTerminal.completedAt,
+            },
           ),
         );
-        return {
-          bridgeStatus: "blocked",
-          bridgeSummary:
-            "OpenClaw aborted the zero-effect asynchronous run and cleaned its session.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId: requestedBackendRunId,
-            backendAgentId: config.readonlyBrowserAgentId,
-            sessionKey: obligation.backendSubmission.sessionKey,
-          },
-          evidence: {
-            externalEffectBudget: 0,
-            sideEffectsPerformed: false,
-            toolsAllowed: [],
-            terminal: true,
-            cancellationRequested: true,
-            terminationProven: true,
-            sessionCleaned: true,
-          },
-        };
+        return output;
       } catch (error) {
         mutateCleanupStore(() =>
           cleanupStore.releaseCleanup(
@@ -1199,37 +2144,100 @@ export async function sweepHermesBridgeCleanupObligations(params: {
           throw new Error("Durable async cleanup requires the exact attempted backend submission.");
         }
         const deadlineAt = Date.now() + 30_000;
-        const admitted = await withDeadline(
-          () =>
-            params.subagent.run({
-              ...obligation.backendSubmission!,
-              idempotencyKey: obligation.backendAdmissionKey,
-            }),
-          deadlineAt,
-          "durable async backend admission reconciliation",
-        );
-        params.store.confirmCleanupBackendAdmission(
-          obligation.idempotencyKey,
-          obligation.requestHash,
-          obligation.generation,
-          obligation.backendAdmissionKey,
-          admitted.runId,
-        );
-        const wait = await withDeadline(
-          () =>
-            params.subagent.waitForRun({
-              runId: admitted.runId,
-              timeoutMs: remainingTimeoutMs(
+        let auditedTerminal = obligation.auditedTerminal;
+        if (!auditedTerminal) {
+          const admitted = await withDeadline(
+            () =>
+              params.subagent.run({
+                ...obligation.backendSubmission!,
+                idempotencyKey: obligation.backendAdmissionKey,
+              }),
+            deadlineAt,
+            "durable async backend admission reconciliation",
+          );
+          params.store.confirmCleanupBackendAdmission(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            obligation.backendAdmissionKey,
+            admitted.runId,
+          );
+          const wait = await withDeadline(
+            () =>
+              params.subagent.waitForRun({
+                runId: admitted.runId,
+                timeoutMs: remainingTimeoutMs(
+                  deadlineAt,
+                  20_000,
+                  "durable async backend termination",
+                ),
+              }),
+            deadlineAt,
+            "durable async backend termination",
+          );
+          if (!waitResultIsTerminal(wait)) {
+            throw new Error("Durable async cleanup could not prove backend termination.");
+          }
+          let audit: { resultText: string; transcriptMessageCount: number } | undefined;
+          let auditError: string | undefined;
+          if (wait.status === "ok") {
+            try {
+              audit = await withDeadline(
+                () =>
+                  auditZeroEffectTerminal(
+                    params.subagent,
+                    obligation.backendSubmission!.sessionKey,
+                  ),
                 deadlineAt,
-                20_000,
-                "durable async backend termination",
-              ),
-            }),
-          deadlineAt,
-          "durable async backend termination",
-        );
-        if (!waitResultIsTerminal(wait)) {
-          throw new Error("Durable async cleanup could not prove backend termination.");
+                "durable async transcript audit",
+              );
+            } catch (error) {
+              auditError =
+                error instanceof Error ? error.message : "Durable async transcript audit failed.";
+            }
+          }
+          const auditPassed = wait.status === "ok" && Boolean(audit);
+          const auditedOutput = {
+            bridgeStatus: auditPassed ? "succeeded" : "failed",
+            bridgeSummary: auditPassed
+              ? "OpenClaw zero-effect asynchronous run completed."
+              : auditError ||
+                `OpenClaw zero-effect asynchronous run terminated with status=${wait.status}.`,
+            backendExecution: {
+              executorBackend: "openclaw" as const,
+              backendRunId: admitted.runId,
+              backendAgentId: params.config.readonlyBrowserAgentId,
+              sessionKey: obligation.backendSubmission.sessionKey,
+            },
+            evidence: {
+              externalEffectBudget: 0,
+              sideEffectsPerformed: false,
+              toolsAllowed: [],
+              terminal: true,
+              sessionCleaned: false,
+              auditPassed,
+              ...(audit ? { transcriptMessageCount: audit.transcriptMessageCount } : {}),
+              ...(wait.status === "ok" ? {} : { terminalStatus: wait.status }),
+              ...(auditError ? { auditError } : {}),
+            },
+            ...(audit ? { resultText: audit.resultText } : {}),
+          };
+          auditedTerminal = {
+            idempotencyKey: obligation.idempotencyKey,
+            requestHash: obligation.requestHash,
+            generation: obligation.generation,
+            backendRunId: admitted.runId,
+            request: obligation.request,
+            output: auditedOutput,
+            completedAt: Date.now(),
+          };
+          params.store.setCleanupAuditedTerminal(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            cleanupOwnerId,
+            auditedTerminal,
+          );
         }
         await withDeadline(
           () =>
@@ -1239,11 +2247,31 @@ export async function sweepHermesBridgeCleanupObligations(params: {
           deadlineAt,
           "durable async session cleanup",
         );
-        params.store.clearCleanup(
+        const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!auditedEvidence) {
+          throw new Error("Durable async audited terminal is missing evidence.");
+        }
+        const output = {
+          ...auditedTerminal.output,
+          evidence: {
+            ...auditedEvidence,
+            sessionCleaned: true,
+          },
+        };
+        params.store.completeCleanup(
           obligation.idempotencyKey,
           obligation.requestHash,
           obligation.generation,
           cleanupOwnerId,
+          {
+            idempotencyKey: obligation.idempotencyKey,
+            requestHash: obligation.requestHash,
+            generation: obligation.generation,
+            backendRunId: auditedTerminal.backendRunId,
+            request: obligation.request,
+            output,
+            completedAt: auditedTerminal.completedAt,
+          },
         );
         completed += 1;
       } catch {
@@ -1287,72 +2315,362 @@ export async function sweepHermesBridgeCleanupObligations(params: {
         30_000,
       );
       const deadlineAt = Date.now() + cleanupWindowMs;
-      let backendRunTerminal = obligation.backendStartAttempted !== true;
-      let backendRunId = obligation.backendRunId;
-      const backendAdmissionKey = obligation.backendAdmissionKey;
-      for (const delayMs of [0, 500, 1_500]) {
-        await waitForReconciliation(delayMs, deadlineAt);
+      if (obligation.auditedTerminal) {
+        let auditedTerminal = obligation.auditedTerminal;
+        if (
+          auditedTerminal.idempotencyKey !== obligation.idempotencyKey ||
+          auditedTerminal.requestHash !== obligation.requestHash ||
+          auditedTerminal.generation !== obligation.generation ||
+          auditedTerminal.request.taskId !== "openclaw.browser.read_snapshot"
+        ) {
+          throw new Error("Durable browser audited terminal identity does not match.");
+        }
         await deleteCorrelatedTabs(tabLabel, deadlineAt);
         await withDeadline(
           () => params.subagent.deleteSession({ sessionKey }),
           deadlineAt,
-          "durable session cleanup",
+          "durable audited browser session cleanup",
         );
-        if (obligation.backendStartAttempted) {
-          if (!backendAdmissionKey || !obligation.backendSubmission) {
-            throw new Error(
-              "Durable cleanup cannot reconcile a start without the exact backend submission.",
-            );
-          }
-          const admitted = await withDeadline(
-            () =>
-              params.subagent.run({
-                ...obligation.backendSubmission!,
-                idempotencyKey: backendAdmissionKey,
-              }),
-            deadlineAt,
-            "durable backend admission reconciliation",
-          );
-          params.store.confirmCleanupBackendAdmission(
-            obligation.idempotencyKey,
-            obligation.requestHash,
-            obligation.generation,
-            backendAdmissionKey,
-            admitted.runId,
-          );
-          backendRunId = admitted.runId;
+        if ((await correlatedTabIds(tabLabel, deadlineAt)).length > 0) {
+          throw new Error("Correlated browser tabs remain after audited cleanup.");
+        }
+        const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!auditedEvidence) {
+          throw new Error("Durable browser audited terminal is missing evidence.");
+        }
+        if (
+          auditedEvidence.cancellationRequested === true &&
+          auditedEvidence.terminationProven !== true
+        ) {
           const wait = await withDeadline(
             () =>
               params.subagent.waitForRun({
-                runId: backendRunId!,
-                timeoutMs: remainingTimeoutMs(deadlineAt, 3_000, "durable backend run termination"),
+                runId: auditedTerminal.backendRunId,
+                timeoutMs: remainingTimeoutMs(
+                  deadlineAt,
+                  3_000,
+                  "durable cancelled browser run termination",
+                ),
               }),
             deadlineAt,
-            "durable backend run termination",
+            "durable cancelled browser run termination",
           );
-          backendRunTerminal = waitResultIsTerminal(wait);
-          if (backendRunTerminal) {
-            break;
+          if (!waitResultIsTerminal(wait)) {
+            throw new Error("Durable browser cancellation has not proven termination.");
           }
+          auditedTerminal = {
+            ...auditedTerminal,
+            output: {
+              ...auditedTerminal.output,
+              evidence: {
+                ...auditedEvidence,
+                terminationProven: true,
+              },
+            },
+          };
+          params.store.setCleanupAuditedTerminal(
+            obligation.idempotencyKey,
+            obligation.requestHash,
+            obligation.generation,
+            cleanupOwnerId,
+            auditedTerminal,
+          );
         }
+        const terminalEvidence = asRecord(auditedTerminal.output.evidence);
+        if (!terminalEvidence) {
+          throw new Error("Durable browser terminal evidence disappeared during cancellation.");
+        }
+        params.store.completeCleanup(
+          obligation.idempotencyKey,
+          obligation.requestHash,
+          obligation.generation,
+          cleanupOwnerId,
+          {
+            ...auditedTerminal,
+            output: {
+              ...auditedTerminal.output,
+              evidence: {
+                ...terminalEvidence,
+                sessionCleaned: true,
+                browserTabsCleaned: true,
+              },
+            },
+          },
+        );
+        completed += 1;
+        continue;
       }
-      await waitForReconciliation(500, deadlineAt);
-      if ((await correlatedTabIds(tabLabel, deadlineAt)).length > 0) {
-        throw new Error("Correlated browser tabs remain after durable cleanup.");
+      if (!obligation.backendStartAttempted) {
+        await deleteCorrelatedTabs(tabLabel, deadlineAt);
+        await withDeadline(
+          () => params.subagent.deleteSession({ sessionKey }),
+          deadlineAt,
+          "unused durable browser session cleanup",
+        );
+        if ((await correlatedTabIds(tabLabel, deadlineAt)).length > 0) {
+          throw new Error("Correlated browser tabs remain after unused durable cleanup.");
+        }
+        params.store.clearCleanup(
+          obligation.idempotencyKey,
+          obligation.requestHash,
+          obligation.generation,
+          cleanupOwnerId,
+        );
+        completed += 1;
+        continue;
       }
-      if (!backendRunTerminal) {
-        throw new Error("Durable cleanup could not prove the exact backend run terminated.");
+      if (!obligation.backendAdmissionKey || !obligation.backendSubmission) {
+        throw new Error(
+          "Durable cleanup cannot reconcile a start without the exact backend submission.",
+        );
       }
-      await withDeadline(
-        () => params.subagent.deleteSession({ sessionKey }),
+      const admitted = await withDeadline(
+        () =>
+          params.subagent.run({
+            ...obligation.backendSubmission!,
+            idempotencyKey: obligation.backendAdmissionKey!,
+          }),
         deadlineAt,
-        "final durable session cleanup",
+        "durable backend admission reconciliation",
       );
-      params.store.clearCleanup(
+      params.store.confirmCleanupBackendAdmission(
+        obligation.idempotencyKey,
+        obligation.requestHash,
+        obligation.generation,
+        obligation.backendAdmissionKey,
+        admitted.runId,
+      );
+      let wait = await withDeadline(
+        () =>
+          params.subagent.waitForRun({
+            runId: admitted.runId,
+            timeoutMs: remainingTimeoutMs(deadlineAt, 3_000, "durable backend run termination"),
+          }),
+        deadlineAt,
+        "durable backend run termination",
+      );
+      for (const delayMs of [500, 1_500]) {
+        if (waitResultIsTerminal(wait)) {
+          break;
+        }
+        await waitForReconciliation(delayMs, deadlineAt);
+        wait = await withDeadline(
+          () =>
+            params.subagent.waitForRun({
+              runId: admitted.runId,
+              timeoutMs: remainingTimeoutMs(deadlineAt, 3_000, "durable backend run termination"),
+            }),
+          deadlineAt,
+          "durable backend run termination",
+        );
+      }
+      let auditedOutput: Record<string, unknown>;
+      if (!waitResultIsTerminal(wait)) {
+        auditedOutput = {
+          bridgeStatus: "blocked",
+          bridgeSummary: "OpenClaw is cancelling an overdue read-only browser run.",
+          backendExecution: {
+            executorBackend: "openclaw" as const,
+            backendRunId: admitted.runId,
+            backendAgentId: params.config.readonlyBrowserAgentId,
+            sessionKey,
+          },
+          evidence: {
+            requestedUrl: validated.url,
+            externalEffectBudget: 0,
+            sideEffectsPerformed: false,
+            terminal: true,
+            cancellationRequested: true,
+            terminationProven: false,
+            sessionCleaned: false,
+            browserTabsCleaned: false,
+          },
+        };
+      } else if (wait.status === "ok") {
+        try {
+          const transcript = await withDeadline(
+            () => params.subagent.getSessionMessages({ sessionKey, limit: 1_000 }),
+            deadlineAt,
+            "durable browser transcript audit",
+          );
+          if (transcript.messages.length >= 1_000) {
+            throw new Error("durable browser transcript reached the audit limit.");
+          }
+          if (transcriptContainsToolActivity(transcript.messages)) {
+            throw new Error("durable browser transcript contained tool activity.");
+          }
+          const resultText = finalAssistantText(transcript.messages);
+          const message = obligation.backendSubmission.message;
+          const capturedEvidence = asRecord(
+            JSON.parse(message.slice(message.lastIndexOf("\n") + 1)),
+          );
+          if (
+            !capturedEvidence ||
+            typeof capturedEvidence.url !== "string" ||
+            typeof capturedEvidence.title !== "string" ||
+            typeof capturedEvidence.snapshotExcerpt !== "string" ||
+            typeof capturedEvidence.targetId !== "string"
+          ) {
+            throw new Error("durable browser cleanup is missing captured evidence.");
+          }
+          validateReviewerResult(resultText, {
+            url: capturedEvidence.url,
+            title: capturedEvidence.title,
+            snapshotExcerpt: capturedEvidence.snapshotExcerpt,
+          });
+          auditedOutput = {
+            bridgeStatus: "succeeded",
+            bridgeSummary: "OpenClaw completed a real read-only browser snapshot.",
+            backendExecution: {
+              executorBackend: "openclaw" as const,
+              backendRunId: admitted.runId,
+              backendAgentId: params.config.readonlyBrowserAgentId,
+              sessionKey,
+            },
+            evidence: {
+              requestedUrl: capturedEvidence.url,
+              browserTargetId: capturedEvidence.targetId,
+              browserSnapshotChars: capturedEvidence.snapshotExcerpt.length,
+              transcriptMessageCount: transcript.messages.length,
+              externalEffectBudget: 0,
+              sideEffectsPerformed: false,
+              terminal: true,
+              auditPassed: true,
+              sessionCleaned: false,
+              browserTabsCleaned: false,
+            },
+            resultText,
+          };
+        } catch (error) {
+          const auditError =
+            error instanceof Error ? error.message : "durable browser transcript audit failed.";
+          auditedOutput = {
+            bridgeStatus: "failed",
+            bridgeSummary: auditError,
+            backendExecution: {
+              executorBackend: "openclaw" as const,
+              backendRunId: admitted.runId,
+              backendAgentId: params.config.readonlyBrowserAgentId,
+              sessionKey,
+            },
+            evidence: {
+              requestedUrl: validated.url,
+              externalEffectBudget: 0,
+              sideEffectsPerformed: false,
+              terminal: true,
+              auditPassed: false,
+              auditError,
+              sessionCleaned: false,
+              browserTabsCleaned: false,
+            },
+          };
+        }
+      } else {
+        auditedOutput = {
+          bridgeStatus: "failed",
+          bridgeSummary:
+            wait.error || `OpenClaw browser reviewer ended with status=${wait.status}.`,
+          backendExecution: {
+            executorBackend: "openclaw" as const,
+            backendRunId: admitted.runId,
+            backendAgentId: params.config.readonlyBrowserAgentId,
+            sessionKey,
+          },
+          evidence: {
+            requestedUrl: validated.url,
+            externalEffectBudget: 0,
+            sideEffectsPerformed: false,
+            terminal: true,
+            auditPassed: false,
+            sessionCleaned: false,
+            browserTabsCleaned: false,
+          },
+        };
+      }
+      let auditedTerminal = {
+        idempotencyKey: obligation.idempotencyKey,
+        requestHash: obligation.requestHash,
+        generation: obligation.generation,
+        backendRunId: admitted.runId,
+        request: obligation.request,
+        output: auditedOutput,
+        completedAt: Date.now(),
+      };
+      params.store.setCleanupAuditedTerminal(
         obligation.idempotencyKey,
         obligation.requestHash,
         obligation.generation,
         cleanupOwnerId,
+        auditedTerminal,
+      );
+      await deleteCorrelatedTabs(tabLabel, deadlineAt);
+      await withDeadline(
+        () => params.subagent.deleteSession({ sessionKey }),
+        deadlineAt,
+        "final durable browser session cleanup",
+      );
+      if ((await correlatedTabIds(tabLabel, deadlineAt)).length > 0) {
+        throw new Error("Correlated browser tabs remain after durable cleanup.");
+      }
+      const preCleanupEvidence = asRecord(auditedTerminal.output.evidence);
+      if (
+        preCleanupEvidence?.cancellationRequested === true &&
+        preCleanupEvidence.terminationProven !== true
+      ) {
+        const cancelledWait = await withDeadline(
+          () =>
+            params.subagent.waitForRun({
+              runId: admitted.runId,
+              timeoutMs: remainingTimeoutMs(
+                deadlineAt,
+                3_000,
+                "cancelled durable backend run termination",
+              ),
+            }),
+          deadlineAt,
+          "cancelled durable backend run termination",
+        );
+        if (!waitResultIsTerminal(cancelledWait)) {
+          throw new Error("Durable cleanup aborted the session but could not prove termination.");
+        }
+        auditedTerminal = {
+          ...auditedTerminal,
+          output: {
+            ...auditedTerminal.output,
+            evidence: {
+              ...preCleanupEvidence,
+              terminationProven: true,
+            },
+          },
+        };
+        params.store.setCleanupAuditedTerminal(
+          obligation.idempotencyKey,
+          obligation.requestHash,
+          obligation.generation,
+          cleanupOwnerId,
+          auditedTerminal,
+        );
+      }
+      const auditedEvidence = asRecord(auditedTerminal.output.evidence);
+      if (!auditedEvidence) {
+        throw new Error("Durable browser audited terminal is missing evidence.");
+      }
+      params.store.completeCleanup(
+        obligation.idempotencyKey,
+        obligation.requestHash,
+        obligation.generation,
+        cleanupOwnerId,
+        {
+          ...auditedTerminal,
+          output: {
+            ...auditedTerminal.output,
+            evidence: {
+              ...auditedEvidence,
+              sessionCleaned: true,
+              browserTabsCleaned: true,
+            },
+          },
+        },
       );
       completed += 1;
     } catch {

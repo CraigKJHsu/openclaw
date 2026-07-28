@@ -1,9 +1,13 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
 import { describe, expect, it, vi } from "vitest";
 import { resolveHermesBridgeConfig } from "./config.js";
 import { createHermesBridgeHttpHandler } from "./http-route.js";
-import { MemoryHermesBridgeIdempotencyStore } from "./idempotency-store.js";
+import {
+  hashHermesBridgeRequest,
+  MemoryHermesBridgeIdempotencyStore,
+} from "./idempotency-store.js";
 import { createHermesBridgeResult } from "./schema.js";
 
 function makeRequest(params: {
@@ -444,6 +448,251 @@ describe("Hermes bridge HTTP route", () => {
       });
     }
     expect(executeTask).toHaveBeenCalledOnce();
+
+    const third = makeResponse();
+    await handler(
+      makeRequest({
+        headers: { "x-openclaw-hermes-token": "secret" },
+        body,
+      }),
+      third.res,
+    );
+    expect(third.res.statusCode).toBe(409);
+    expect(JSON.parse(third.res.body)).toMatchObject({
+      error: { type: "idempotency_in_progress" },
+    });
+    expect(executeTask).toHaveBeenCalledOnce();
+  });
+
+  it("replays an async terminal tombstone after poll result persistence fails", async () => {
+    const store = new MemoryHermesBridgeIdempotencyStore();
+    const subagent = {
+      run: vi.fn().mockResolvedValue({ runId: "terminal-replay-run" }),
+      waitForRun: vi.fn().mockResolvedValue({ status: "ok", terminal: true }),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: [
+          {
+            role: "assistant",
+            content: '{"result":"zero-effect async completed","sideEffectsPerformed":false}',
+          },
+        ],
+      }),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+    const handler = createHermesBridgeHttpHandler({
+      resolveConfig: () =>
+        resolveHermesBridgeConfig({
+          enabled: true,
+          mode: "live",
+          hermesMode: "real",
+          sharedSecretEnv: "HERMES_TOKEN",
+          allowedTasks: [
+            "openclaw.agent.zero_effect_async_start",
+            "openclaw.agent.zero_effect_async_poll",
+          ],
+          allowedTools: [],
+        }),
+      env: { HERMES_TOKEN: "secret" },
+      idempotencyStore: store,
+      subagent,
+    });
+    const identity = {
+      delegationId: "terminal-replay-delegation",
+      attemptId: "terminal-replay-attempt",
+      contractFingerprint: "sha256:terminal-replay",
+      project: "hub_ops",
+      topicId: "zero-effect-async",
+    };
+    const base = {
+      protocolVersion: "2.0",
+      dryRun: false,
+      allowedTools: [],
+      identity,
+      routing: {
+        executorBackend: "openclaw",
+        executorProfile: "zero-effect-async",
+        backendAgentId: "missioncrew-browser-readonly",
+      },
+      policy: {
+        externalEffectBudget: 0,
+        workspacePolicy: "dedicated",
+        sessionPolicy: "ephemeral",
+        credentialRefs: [],
+      },
+    };
+    const call = async (body: Record<string, unknown>) => {
+      const { res } = makeResponse();
+      await handler(
+        makeRequest({
+          headers: { "x-openclaw-hermes-token": "secret" },
+          body,
+        }),
+        res,
+      );
+      return { statusCode: res.statusCode, body: JSON.parse(res.body) };
+    };
+
+    await expect(
+      call({
+        ...base,
+        taskId: "openclaw.agent.zero_effect_async_start",
+        idempotencyKey: "terminal-replay-start",
+        input: {},
+      }),
+    ).resolves.toMatchObject({
+      statusCode: 200,
+      body: { status: "accepted", backendExecution: { backendRunId: "terminal-replay-run" } },
+    });
+
+    vi.spyOn(store, "set").mockImplementationOnce(() => {
+      throw new Error("injected terminal result persistence failure");
+    });
+    const pollBody = {
+      ...base,
+      taskId: "openclaw.agent.zero_effect_async_poll",
+      idempotencyKey: "terminal-replay-poll",
+      input: {
+        startIdempotencyKey: "terminal-replay-start",
+        backendRunId: "terminal-replay-run",
+      },
+    };
+    await expect(call(pollBody)).resolves.toMatchObject({
+      statusCode: 503,
+      body: {
+        status: "failed",
+        error: { type: "idempotency_persistence_failed" },
+      },
+    });
+    expect(store.getCleanup("terminal-replay-start")).toBeUndefined();
+    expect(store.getCleanupTerminal("terminal-replay-start")).toMatchObject({
+      backendRunId: "terminal-replay-run",
+      output: { bridgeStatus: "succeeded", evidence: { terminal: true } },
+    });
+
+    await expect(call(pollBody)).resolves.toMatchObject({
+      statusCode: 200,
+      body: {
+        status: "succeeded",
+        backendExecution: { backendRunId: "terminal-replay-run" },
+        output: { evidence: { terminal: true, sessionCleaned: true } },
+      },
+    });
+    expect(subagent.waitForRun).toHaveBeenCalledOnce();
+    expect(subagent.deleteSession).toHaveBeenCalledOnce();
+  });
+
+  it("releases a browser start claim after its terminal result persistence fails", async () => {
+    const store = new MemoryHermesBridgeIdempotencyStore();
+    const executeTask = vi.fn(async ({ request }) => {
+      const requestHash = hashHermesBridgeRequest(request);
+      if (!store.getCleanupTerminal(request.idempotencyKey)) {
+        const generation = "browser-start-terminal-generation";
+        store.registerCleanup({
+          idempotencyKey: request.idempotencyKey,
+          requestHash,
+          generation,
+          backendRunId: "browser-start-terminal-run",
+          request,
+          dueAt: 1,
+        });
+        expect(
+          store.claimCleanup(request.idempotencyKey, requestHash, generation, {
+            ownerId: "browser-start-terminal-owner",
+            leaseMs: 30_000,
+          }),
+        ).toBe(true);
+        store.completeCleanup(
+          request.idempotencyKey,
+          requestHash,
+          generation,
+          "browser-start-terminal-owner",
+          {
+            idempotencyKey: request.idempotencyKey,
+            requestHash,
+            generation,
+            backendRunId: "browser-start-terminal-run",
+            request,
+            output: {
+              bridgeStatus: "succeeded",
+              evidence: { terminal: true, sessionCleaned: true },
+            },
+            completedAt: 2,
+          },
+        );
+      }
+      return createHermesBridgeResult({
+        ok: true,
+        request,
+        mode: "live",
+        status: "succeeded",
+        summary: "browser snapshot completed",
+      });
+    });
+    const handler = createHermesBridgeHttpHandler({
+      resolveConfig: () =>
+        resolveHermesBridgeConfig({
+          enabled: true,
+          mode: "live",
+          hermesMode: "real",
+          sharedSecretEnv: "HERMES_TOKEN",
+          allowedTasks: ["openclaw.browser.read_snapshot"],
+          allowedTools: ["browser.read"],
+        }),
+      env: { HERMES_TOKEN: "secret" },
+      idempotencyStore: store,
+      executeTask,
+    });
+    const body = {
+      protocolVersion: "2.0",
+      taskId: "openclaw.browser.read_snapshot",
+      idempotencyKey: "browser-start-terminal-key",
+      dryRun: false,
+      allowedTools: ["browser.read"],
+      identity: {
+        delegationId: "browser-start-terminal-delegation",
+        attemptId: "browser-start-terminal-attempt",
+        contractFingerprint: "sha256:browser-start-terminal",
+        project: "hub_ops",
+        topicId: "browser-start-terminal",
+      },
+      routing: {
+        executorBackend: "openclaw",
+        executorProfile: "browser-readonly",
+        backendAgentId: "missioncrew-browser-readonly",
+      },
+      policy: {
+        externalEffectBudget: 0,
+        workspacePolicy: "dedicated",
+        sessionPolicy: "ephemeral",
+        credentialRefs: [],
+      },
+      input: { url: "https://example.com" },
+    };
+    const call = async () => {
+      const { res } = makeResponse();
+      await handler(
+        makeRequest({
+          headers: { "x-openclaw-hermes-token": "secret" },
+          body,
+        }),
+        res,
+      );
+      return { statusCode: res.statusCode, body: JSON.parse(res.body) };
+    };
+
+    vi.spyOn(store, "set").mockImplementationOnce(() => {
+      throw new Error("injected browser start persistence failure");
+    });
+    await expect(call()).resolves.toMatchObject({
+      statusCode: 503,
+      body: { error: { type: "idempotency_persistence_failed" } },
+    });
+    await expect(call()).resolves.toMatchObject({
+      statusCode: 200,
+      body: { status: "succeeded" },
+    });
+    expect(executeTask).toHaveBeenCalledTimes(2);
   });
 
   it("returns 503 and releases the claim for a transient cleanup-store failure", async () => {

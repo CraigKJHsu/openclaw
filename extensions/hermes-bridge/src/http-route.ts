@@ -45,10 +45,21 @@ function statusCodeForResult(result: HermesBridgeResult): number {
 }
 
 function isRetryableExecutionResult(result: HermesBridgeResult): boolean {
+  const output =
+    result.output && typeof result.output === "object" && !Array.isArray(result.output)
+      ? (result.output as Record<string, unknown>)
+      : undefined;
+  const evidence =
+    output?.evidence && typeof output.evidence === "object" && !Array.isArray(output.evidence)
+      ? (output.evidence as Record<string, unknown>)
+      : undefined;
   return (
-    result.status === "running" &&
-    (result.error?.type === "cleanup_in_progress" ||
-      result.error?.type === "cleanup_store_unavailable")
+    (result.status === "running" &&
+      (result.error?.type === "cleanup_in_progress" ||
+        result.error?.type === "cleanup_store_unavailable")) ||
+    (result.status === "running" &&
+      result.taskId === "openclaw.agent.zero_effect_async_start" &&
+      evidence?.admissionPending === true)
   );
 }
 
@@ -339,6 +350,60 @@ export function createHermesBridgeHttpHandler(params: HandlerParams) {
         }
         resolveFinalized?.({ result, statusCode: statusCodeForResult(result) });
       } catch (error) {
+        try {
+          const input =
+            request.input && typeof request.input === "object" && !Array.isArray(request.input)
+              ? (request.input as Record<string, unknown>)
+              : {};
+          const startKey =
+            typeof input.startIdempotencyKey === "string"
+              ? input.startIdempotencyKey.trim()
+              : request.idempotencyKey!;
+          const requestedBackendRunId =
+            typeof input.backendRunId === "string" ? input.backendRunId.trim() : undefined;
+          const lifecycleFamilies: Record<string, string> = {
+            "openclaw.browser.read_snapshot_poll": "openclaw.browser.read_snapshot",
+            "openclaw.browser.read_snapshot_cancel": "openclaw.browser.read_snapshot",
+            "openclaw.agent.zero_effect_async_poll": "openclaw.agent.zero_effect_async_start",
+            "openclaw.agent.zero_effect_async_cancel": "openclaw.agent.zero_effect_async_start",
+          };
+          const lifecycleFamily = lifecycleFamilies[request.taskId];
+          const terminalStartFamily = new Set([
+            "openclaw.browser.read_snapshot",
+            "openclaw.agent.zero_effect_async_start",
+          ]).has(request.taskId)
+            ? request.taskId
+            : undefined;
+          const terminal =
+            (lifecycleFamily && requestedBackendRunId) || terminalStartFamily
+              ? idempotencyStore!.getCleanupTerminal(startKey)
+              : undefined;
+          const terminalIdentity = terminal?.request.identity;
+          const identityMatches =
+            terminalIdentity &&
+            terminalIdentity.delegationId === request.identity.delegationId &&
+            terminalIdentity.attemptId === request.identity.attemptId &&
+            terminalIdentity.contractFingerprint === request.identity.contractFingerprint &&
+            terminalIdentity.project === request.identity.project &&
+            terminalIdentity.topicId === request.identity.topicId;
+          const backendRunMatches = terminal?.backendRunId === requestedBackendRunId;
+          const lifecycleTerminalMatches =
+            lifecycleFamily &&
+            terminal?.request.taskId === lifecycleFamily &&
+            backendRunMatches &&
+            startKey !== request.idempotencyKey;
+          const startTerminalMatches =
+            terminalStartFamily &&
+            terminal?.request.taskId === terminalStartFamily &&
+            terminal.requestHash === requestHash &&
+            startKey === request.idempotencyKey;
+          if (terminal && identityMatches && (lifecycleTerminalMatches || startTerminalMatches)) {
+            idempotencyStore!.release(request.idempotencyKey!, requestHash, claimOwnerId!);
+          }
+        } catch {
+          // Retain the request claim when tombstone verification itself is
+          // unavailable; lease recovery remains the ambiguity boundary.
+        }
         const persistenceFailure = createHermesBridgeResult({
           ok: false,
           request,

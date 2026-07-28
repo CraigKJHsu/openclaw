@@ -354,6 +354,170 @@ describe("SqliteHermesBridgeIdempotencyStore", () => {
     store.close();
   });
 
+  it("atomically replaces a claimed cleanup obligation with a terminal tombstone", () => {
+    const directory = mkdtempSync(join(tmpdir(), "hermes-bridge-"));
+    cleanupPaths.push(directory);
+    const path = join(directory, "idempotency.sqlite");
+    const normalized = request();
+    const requestHash = hashHermesBridgeRequest(normalized);
+    const store = new SqliteHermesBridgeIdempotencyStore(path);
+    const backendSubmission = {
+      sessionKey: "agent:missioncrew-browser-readonly:subagent:terminal",
+      message: "Complete zero-effect work.",
+      extraSystemPrompt: "Do not use tools.",
+      lane: "hermes-bridge:test",
+      lightContext: true as const,
+      deliver: false as const,
+      toolsAllow: [] as [],
+      disableTools: true as const,
+    };
+
+    store.registerCleanup({
+      idempotencyKey: normalized.idempotencyKey,
+      requestHash,
+      generation: "generation-terminal",
+      backendAdmissionKey: "admission-terminal",
+      backendRunId: "run-terminal",
+      backendStartAttempted: true,
+      backendSubmission,
+      request: normalized,
+      dueAt: 1,
+    });
+    expect(
+      store.claimCleanup(normalized.idempotencyKey, requestHash, "generation-terminal", {
+        ownerId: "terminal-owner",
+        leaseMs: 30_000,
+        nowMs: 1,
+      }),
+    ).toBe(true);
+    store.completeCleanup(
+      normalized.idempotencyKey,
+      requestHash,
+      "generation-terminal",
+      "terminal-owner",
+      {
+        idempotencyKey: normalized.idempotencyKey,
+        requestHash,
+        generation: "generation-terminal",
+        backendRunId: "run-terminal",
+        request: normalized,
+        output: { bridgeStatus: "succeeded", evidence: { terminal: true } },
+        completedAt: 2,
+      },
+    );
+    expect(store.getCleanup(normalized.idempotencyKey)).toBeUndefined();
+    store.close();
+
+    const reopened = new SqliteHermesBridgeIdempotencyStore(path);
+    expect(reopened.getCleanupTerminal(normalized.idempotencyKey)).toEqual({
+      idempotencyKey: normalized.idempotencyKey,
+      requestHash,
+      generation: "generation-terminal",
+      backendRunId: "run-terminal",
+      request: normalized,
+      output: { bridgeStatus: "succeeded", evidence: { terminal: true } },
+      completedAt: 2,
+    });
+    expect(
+      reopened.registerCleanup({
+        idempotencyKey: normalized.idempotencyKey,
+        requestHash,
+        generation: "generation-after-terminal",
+        request: normalized,
+        dueAt: 3,
+      }),
+    ).toBe(false);
+    expect(reopened.getCleanup(normalized.idempotencyKey)).toBeUndefined();
+    expect(reopened.listDueCleanup(Number.MAX_SAFE_INTEGER)).toEqual([]);
+    reopened.close();
+  });
+
+  it("persists an audited terminal phase before destructive cleanup", () => {
+    const directory = mkdtempSync(join(tmpdir(), "hermes-bridge-"));
+    cleanupPaths.push(directory);
+    const path = join(directory, "idempotency.sqlite");
+    const normalized = request();
+    const requestHash = hashHermesBridgeRequest(normalized);
+    const auditedTerminal = {
+      idempotencyKey: normalized.idempotencyKey,
+      requestHash,
+      generation: "generation-audited",
+      backendRunId: "run-audited",
+      request: normalized,
+      output: {
+        bridgeStatus: "succeeded",
+        evidence: { terminal: true, sessionCleaned: false },
+      },
+      completedAt: 2,
+    };
+    const first = new SqliteHermesBridgeIdempotencyStore(path);
+    first.registerCleanup({
+      idempotencyKey: normalized.idempotencyKey,
+      requestHash,
+      generation: "generation-audited",
+      backendAdmissionKey: "admission-audited",
+      backendRunId: "run-audited",
+      backendStartAttempted: true,
+      backendSubmission: {
+        sessionKey: "agent:missioncrew-browser-readonly:subagent:audited",
+        message: "Audited result.",
+        extraSystemPrompt: "Do not use tools.",
+        lane: "hermes-bridge:test",
+        lightContext: true,
+        deliver: false,
+        toolsAllow: [],
+        disableTools: true,
+      },
+      request: normalized,
+      dueAt: 1,
+    });
+    expect(
+      first.claimCleanup(normalized.idempotencyKey, requestHash, "generation-audited", {
+        ownerId: "auditor",
+        leaseMs: 30_000,
+        nowMs: 1,
+      }),
+    ).toBe(true);
+    first.setCleanupAuditedTerminal(
+      normalized.idempotencyKey,
+      requestHash,
+      "generation-audited",
+      "auditor",
+      auditedTerminal,
+    );
+    first.close();
+
+    const reopened = new SqliteHermesBridgeIdempotencyStore(path);
+    expect(reopened.getCleanup(normalized.idempotencyKey)).toMatchObject({
+      auditedTerminal,
+    });
+    expect(
+      reopened.claimCleanup(normalized.idempotencyKey, requestHash, "generation-audited", {
+        ownerId: "cleaner",
+        leaseMs: 30_000,
+        nowMs: 30_002,
+      }),
+    ).toBe(true);
+    reopened.completeCleanup(
+      normalized.idempotencyKey,
+      requestHash,
+      "generation-audited",
+      "cleaner",
+      {
+        ...auditedTerminal,
+        output: {
+          bridgeStatus: "succeeded",
+          evidence: { terminal: true, sessionCleaned: true },
+        },
+      },
+    );
+    expect(reopened.getCleanup(normalized.idempotencyKey)).toBeUndefined();
+    expect(reopened.getCleanupTerminal(normalized.idempotencyKey)).toMatchObject({
+      output: { evidence: { sessionCleaned: true } },
+    });
+    reopened.close();
+  });
+
   it("quarantines legacy cleanup rows that lack authoritative backend admission identity", () => {
     const directory = mkdtempSync(join(tmpdir(), "hermes-bridge-"));
     cleanupPaths.push(directory);
