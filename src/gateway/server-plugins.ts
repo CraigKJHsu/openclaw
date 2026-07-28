@@ -638,6 +638,8 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
           ...(params.extraSystemPrompt && { extraSystemPrompt: params.extraSystemPrompt }),
           ...(params.lane && { lane: params.lane }),
           ...(params.lightContext === true && { bootstrapContextMode: "lightweight" }),
+          ...(params.toolsAllow !== undefined && { toolsAllow: params.toolsAllow }),
+          ...(params.disableTools !== undefined && { disableTools: params.disableTools }),
           // The gateway `agent` schema requires `idempotencyKey: NonEmptyString`,
           // so fall back to a generated UUID when the caller omits it. Without
           // this, plugin subagent runs (for example memory-core dreaming
@@ -657,14 +659,16 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
       return { runId };
     },
     async waitForRun(params) {
-      const payload = await dispatchGatewayMethod<{ status?: string; error?: string }>(
-        "agent.wait",
-        {
-          runId: params.runId,
-          ...(params.timeoutMs != null && { timeoutMs: params.timeoutMs }),
-        },
-      );
-      let status = payload?.status;
+      const payload = await dispatchGatewayMethod<{
+        status?: string;
+        error?: string;
+        endedAt?: number;
+      }>("agent.wait", {
+        runId: params.runId,
+        ...(params.timeoutMs != null && { timeoutMs: params.timeoutMs }),
+      });
+      const rawStatus = payload?.status;
+      let status = rawStatus;
       if (status === "completed" || status === "succeeded") {
         status = "ok";
       } else if (status === "error" && payload?.error?.trim().toLowerCase() === "completed") {
@@ -673,8 +677,17 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
       if (status !== "ok" && status !== "error" && status !== "timeout") {
         throw new Error(`Gateway agent.wait returned unexpected status: ${payload?.status}`);
       }
+      const terminal =
+        rawStatus === "ok" ||
+        rawStatus === "completed" ||
+        rawStatus === "succeeded" ||
+        rawStatus === "error" ||
+        (rawStatus === "timeout" &&
+          typeof payload?.endedAt === "number" &&
+          Number.isFinite(payload.endedAt));
       return {
         status,
+        terminal,
         ...(status !== "ok" &&
           typeof payload?.error === "string" &&
           payload.error && { error: payload.error }),

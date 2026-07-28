@@ -99,8 +99,9 @@ describe("applyEmbeddedAttemptToolsAllow", () => {
   it("keeps plugin-only allowlists on the shared tool policy path", () => {
     const tools = [{ name: "memory_search" }, { name: "plugin_extra" }];
 
-    expect(resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["memory_search"] }))
-      .toHaveProperty("includeCoreTools", false);
+    expect(
+      resolveEmbeddedAttemptToolConstructionPlan({ toolsAllow: ["memory_search"] }),
+    ).toHaveProperty("includeCoreTools", false);
     expect(
       applyEmbeddedAttemptToolsAllow(tools, ["memory_search"]).map((tool) => tool.name),
     ).toEqual(["memory_search"]);
@@ -207,6 +208,30 @@ describe("resolveEmbeddedAttemptToolConstructionPlan", () => {
         includePluginTools: false,
       },
     });
+  });
+
+  it("hard-disables the constructed tool inventory for reviewer runs", () => {
+    const availableTools = [{ name: "session_status" }, { name: "exec" }];
+    const plan = resolveEmbeddedAttemptToolConstructionPlan({
+      toolsAllow: [],
+      disableTools: true,
+    });
+
+    expectConstructionPlan(plan, {
+      constructTools: false,
+      includeCoreTools: false,
+      coding: {
+        includeBaseCodingTools: false,
+        includeShellTools: false,
+        includeChannelTools: false,
+        includeOpenClawTools: false,
+        includePluginTools: false,
+      },
+    });
+    const constructedTools = plan.constructTools
+      ? applyEmbeddedAttemptToolsAllow(availableTools, plan.runtimeToolAllowlist)
+      : [];
+    expect(constructedTools).toEqual([]);
   });
 
   it("constructs message tool for forced message delivery on explicit no-tools runs", () => {

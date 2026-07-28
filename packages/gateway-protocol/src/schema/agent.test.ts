@@ -57,6 +57,17 @@ const musicCompletionEvent: AgentInternalEvent = {
 };
 
 describe("AgentParamsSchema", () => {
+  it("accepts an explicit empty per-run tool allowlist", () => {
+    expect(
+      Value.Check(AgentParamsSchema, {
+        message: "review evidence",
+        idempotencyKey: "run-without-tools",
+        toolsAllow: [],
+        disableTools: true,
+      }),
+    ).toBe(true);
+  });
+
   it("accepts generated music attachments on internal completion events", () => {
     const params = makeAgentParamsWithInternalEvent(musicCompletionEvent);
 

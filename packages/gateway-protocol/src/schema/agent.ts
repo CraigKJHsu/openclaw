@@ -232,6 +232,8 @@ export const AgentParamsSchema = Type.Object(
     ),
     disableMessageTool: Type.Optional(Type.Boolean()),
     voiceWakeTrigger: Type.Optional(Type.String()),
+    toolsAllow: Type.Optional(Type.Array(NonEmptyString, { maxItems: 256 })),
+    disableTools: Type.Optional(Type.Boolean()),
     idempotencyKey: NonEmptyString,
     label: Type.Optional(SessionLabelString),
   },

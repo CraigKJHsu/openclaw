@@ -1,5 +1,6 @@
 export type HermesBridgeMode = "mock" | "live";
 export type HermesRuntimeMode = "mock" | "real";
+export const MAX_HERMES_BRIDGE_LIVE_RUNTIME_SECONDS = 3_600;
 
 export type HermesBridgeConfig = {
   enabled: boolean;
@@ -10,6 +11,9 @@ export type HermesBridgeConfig = {
   allowedTasks: string[];
   allowedTools: string[];
   maxRequestBytes: number;
+  idempotencyDbPath: string;
+  readonlyBrowserAgentId: string;
+  maxLiveRuntimeSeconds: number;
 };
 
 export const DEFAULT_HERMES_BRIDGE_CONFIG: HermesBridgeConfig = {
@@ -21,6 +25,9 @@ export const DEFAULT_HERMES_BRIDGE_CONFIG: HermesBridgeConfig = {
   allowedTasks: [],
   allowedTools: [],
   maxRequestBytes: 65_536,
+  idempotencyDbPath: "~/.openclaw/hermes-bridge-idempotency.sqlite",
+  readonlyBrowserAgentId: "missioncrew-browser-readonly",
+  maxLiveRuntimeSeconds: 120,
 };
 
 function readObject(value: unknown): Record<string, unknown> {
@@ -77,7 +84,16 @@ function readMaxRequestBytes(value: unknown): number {
   if (!Number.isFinite(value) || typeof value !== "number" || value <= 0) {
     return DEFAULT_HERMES_BRIDGE_CONFIG.maxRequestBytes;
   }
-  return Math.floor(value);
+  const resolved = Math.floor(value);
+  return resolved >= 1 ? resolved : DEFAULT_HERMES_BRIDGE_CONFIG.maxRequestBytes;
+}
+
+function readPositiveInteger(value: unknown, fallback: number, maximum: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return fallback;
+  }
+  const resolved = Math.floor(value);
+  return resolved >= 1 && resolved <= maximum ? resolved : fallback;
 }
 
 export function resolveHermesBridgeConfig(raw: unknown): HermesBridgeConfig {
@@ -91,5 +107,15 @@ export function resolveHermesBridgeConfig(raw: unknown): HermesBridgeConfig {
     allowedTasks: readStringList(config.allowedTasks),
     allowedTools: readStringList(config.allowedTools),
     maxRequestBytes: readMaxRequestBytes(config.maxRequestBytes),
+    idempotencyDbPath:
+      typeof config.idempotencyDbPath === "string" && config.idempotencyDbPath.trim()
+        ? config.idempotencyDbPath.trim()
+        : DEFAULT_HERMES_BRIDGE_CONFIG.idempotencyDbPath,
+    readonlyBrowserAgentId: DEFAULT_HERMES_BRIDGE_CONFIG.readonlyBrowserAgentId,
+    maxLiveRuntimeSeconds: readPositiveInteger(
+      config.maxLiveRuntimeSeconds,
+      DEFAULT_HERMES_BRIDGE_CONFIG.maxLiveRuntimeSeconds,
+      MAX_HERMES_BRIDGE_LIVE_RUNTIME_SECONDS,
+    ),
   };
 }
