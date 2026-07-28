@@ -4,7 +4,8 @@
     "onStartup": true
   },
   "contracts": {
-    "tools": ["hermes_bridge"]
+    "tools": ["hermes_bridge"],
+    "gatewayMethodDispatch": ["authenticated-request"]
   },
   "configSchema": {
     "type": "object",
@@ -54,9 +55,28 @@
         "description": "OpenClaw tool capability names that approved task templates may use."
       },
       "maxRequestBytes": {
-        "type": "number",
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 10485760,
         "default": 65536,
         "description": "Maximum JSON request body size accepted by the bridge route."
+      },
+      "idempotencyDbPath": {
+        "type": "string",
+        "default": "~/.openclaw/hermes-bridge-idempotency.sqlite",
+        "description": "Persistent SQLite database used to deduplicate bridge executions across Gateway restarts."
+      },
+      "readonlyBrowserAgentId": {
+        "type": "string",
+        "enum": ["missioncrew-browser-readonly"],
+        "default": "missioncrew-browser-readonly",
+        "description": "Fixed dedicated OpenClaw agent allowed to review read-only browser snapshot evidence."
+      },
+      "maxLiveRuntimeSeconds": {
+        "type": "integer",
+        "minimum": 1,
+        "default": 120,
+        "description": "Maximum wait time for an explicitly allowlisted live executor."
       }
     }
   }

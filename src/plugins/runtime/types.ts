@@ -18,6 +18,10 @@ export type SubagentRunParams = {
   lightContext?: boolean;
   deliver?: boolean;
   idempotencyKey?: string;
+  /** Per-run authoritative tool allowlist. An explicit empty list disables all tools. */
+  toolsAllow?: string[];
+  /** Per-run hard disable for every tool surface. */
+  disableTools?: boolean;
 };
 
 export type SubagentRunResult = {
@@ -31,6 +35,8 @@ export type SubagentWaitParams = {
 
 export type SubagentWaitResult = {
   status: "ok" | "error" | "timeout";
+  /** True only when Gateway evidence proves this exact run reached a terminal state. */
+  terminal?: boolean;
   error?: string;
 };
 

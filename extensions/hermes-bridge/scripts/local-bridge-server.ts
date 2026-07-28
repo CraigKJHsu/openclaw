@@ -128,7 +128,9 @@ function printStartupDiagnostics(): void {
     console.warn("OPENCLAW_GATEWAY_TOKEN is not configured; task route requests will be rejected.");
   }
   if (!diagnostics.bridgeTokenConfigured) {
-    console.warn("OPENCLAW_HERMES_BRIDGE_TOKEN is not configured; task route requests will fail closed.");
+    console.warn(
+      "OPENCLAW_HERMES_BRIDGE_TOKEN is not configured; task route requests will fail closed.",
+    );
   }
 }
 
