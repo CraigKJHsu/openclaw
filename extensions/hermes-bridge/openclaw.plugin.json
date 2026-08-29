@@ -4,7 +4,12 @@
     "onStartup": true
   },
   "contracts": {
-    "tools": ["hermes_bridge"],
+    "tools": [
+      "hermes_bridge",
+      "facebook_page_publish_preflight",
+      "facebook_page_graph_status",
+      "facebook_page_graph_publish"
+    ],
     "gatewayMethodDispatch": ["authenticated-request"]
   },
   "configSchema": {

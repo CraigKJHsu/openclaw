@@ -7,6 +7,7 @@ export type HermesBridgeExecutionIdentity = {
   contractFingerprint?: string;
   project?: string;
   topicId?: string;
+  taskType?: string;
 };
 
 export type HermesBridgeExecutionRouting = {
@@ -66,6 +67,8 @@ export type HermesBridgeError = {
   message: string;
 };
 
+export type HermesBridgeTokenUsage = Record<string, unknown>;
+
 export type HermesBridgeResult = {
   ok: boolean;
   requestId?: string;
@@ -88,6 +91,7 @@ export type HermesBridgeResult = {
     backendAgentId: string;
     sessionKey: string;
   };
+  tokenUsage?: HermesBridgeTokenUsage;
   output?: unknown;
   error?: HermesBridgeError;
 };
@@ -180,6 +184,14 @@ export function normalizeHermesBridgeRequest(raw: unknown): HermesBridgeValidati
   const explicitIdempotencyKey = readString(record.idempotencyKey);
   const idempotencyKey = explicitIdempotencyKey ?? requestId;
   if (protocolVersion === "2.0") {
+    if (
+      Object.hasOwn(identity, "taskType") &&
+      (typeof identity.taskType !== "string" ||
+        !identity.taskType ||
+        identity.taskType !== identity.taskType.trim())
+    ) {
+      return invalidRequest("Protocol v2 identity.taskType must be a canonical string.");
+    }
     const requiredIdentity = [
       ["delegationId", readString(identity.delegationId)],
       ["attemptId", readString(identity.attemptId)],
@@ -247,6 +259,7 @@ export function normalizeHermesBridgeRequest(raw: unknown): HermesBridgeValidati
           : {}),
         ...(readString(identity.project) ? { project: readString(identity.project) } : {}),
         ...(readString(identity.topicId) ? { topicId: readString(identity.topicId) } : {}),
+        ...(readString(identity.taskType) ? { taskType: readString(identity.taskType) } : {}),
       },
       routing: {
         ...(readExecutorBackend(routing.executorBackend)
@@ -292,6 +305,7 @@ export function createHermesBridgeResult(params: {
   artifacts?: HermesBridgeArtifact[];
   auditLog?: HermesBridgeAuditEvent[];
   backendExecution?: HermesBridgeResult["backendExecution"];
+  tokenUsage?: HermesBridgeTokenUsage;
 }): HermesBridgeResult {
   return {
     ok: params.ok,
@@ -314,6 +328,7 @@ export function createHermesBridgeResult(params: {
         }
       : {}),
     ...(params.backendExecution ? { backendExecution: params.backendExecution } : {}),
+    ...(params.tokenUsage ? { tokenUsage: params.tokenUsage } : {}),
     ...(params.output !== undefined ? { output: params.output } : {}),
     ...(params.error ? { error: params.error } : {}),
   };

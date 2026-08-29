@@ -49,6 +49,16 @@ function readBridgeSummary(output: unknown): string | undefined {
     : undefined;
 }
 
+function readBridgeTokenUsage(output: unknown): Record<string, unknown> | undefined {
+  if (!output || typeof output !== "object" || !("tokenUsage" in output)) {
+    return undefined;
+  }
+  const tokenUsage = (output as Record<string, unknown>).tokenUsage;
+  return tokenUsage && typeof tokenUsage === "object" && !Array.isArray(tokenUsage)
+    ? (tokenUsage as Record<string, unknown>)
+    : undefined;
+}
+
 function reject(params: {
   request?: HermesBridgeRequest;
   type: string;
@@ -125,8 +135,17 @@ export async function executeHermesBridgeTask({
   const requestDeniedTools = task.requiredTools.filter(
     (tool) => !request.allowedTools.includes(tool),
   );
-  if (configDeniedTools.length > 0 || requestDeniedTools.length > 0) {
-    const missing = Array.from(new Set([...configDeniedTools, ...requestDeniedTools])).toSorted();
+  const unallowlistedRequestedTools = request.allowedTools.filter(
+    (tool) => !config.allowedTools.includes(tool),
+  );
+  if (
+    configDeniedTools.length > 0 ||
+    requestDeniedTools.length > 0 ||
+    unallowlistedRequestedTools.length > 0
+  ) {
+    const missing = Array.from(
+      new Set([...configDeniedTools, ...requestDeniedTools, ...unallowlistedRequestedTools]),
+    ).toSorted();
     return reject({
       request,
       type: "tool_not_allowed",
@@ -220,6 +239,7 @@ export async function executeHermesBridgeTask({
       `Hermes bridge task succeeded: ${request.taskId}`,
     output,
     backendExecution,
+    tokenUsage: readBridgeTokenUsage(output),
     auditLog: [
       createAuditEvent("accepted", `Accepted Hermes task ${request.taskId}.`),
       createAuditEvent(

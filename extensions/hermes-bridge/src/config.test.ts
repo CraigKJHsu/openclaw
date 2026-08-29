@@ -41,7 +41,7 @@ describe("resolveHermesBridgeConfig", () => {
         readonlyBrowserAgentId: "unexpected-agent",
       }),
     ).toMatchObject({
-      maxRequestBytes: 65_536,
+      maxRequestBytes: 262_144,
       maxLiveRuntimeSeconds: 120,
       readonlyBrowserAgentId: "missioncrew-browser-readonly",
     });

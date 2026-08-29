@@ -1,5 +1,6 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveHermesBridgeConfig } from "./src/config.js";
+import { createFacebookPageCapabilityTools } from "./src/facebook-page-capability.js";
 import { createHermesBridgeHttpHandler } from "./src/http-route.js";
 import { SqliteHermesBridgeIdempotencyStore } from "./src/idempotency-store.js";
 import { sweepHermesBridgeCleanupObligations } from "./src/task-registry.js";
@@ -91,5 +92,13 @@ export default definePluginEntry({
       },
       { name: "hermes_bridge", optional: true },
     );
+    api.registerTool((ctx) => createFacebookPageCapabilityTools(ctx, resolveConfig()), {
+      names: [
+        "facebook_page_publish_preflight",
+        "facebook_page_graph_status",
+        "facebook_page_graph_publish",
+      ],
+      optional: true,
+    });
   },
 });

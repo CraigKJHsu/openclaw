@@ -24,7 +24,7 @@ export const DEFAULT_HERMES_BRIDGE_CONFIG: HermesBridgeConfig = {
   sharedSecretEnv: "OPENCLAW_HERMES_BRIDGE_TOKEN",
   allowedTasks: [],
   allowedTools: [],
-  maxRequestBytes: 65_536,
+  maxRequestBytes: 262_144,
   idempotencyDbPath: "~/.openclaw/hermes-bridge-idempotency.sqlite",
   readonlyBrowserAgentId: "missioncrew-browser-readonly",
   maxLiveRuntimeSeconds: 120,

@@ -10,7 +10,7 @@ describe("hermes-bridge plugin entry", () => {
       match?: string;
       gatewayRuntimeScopeSurface?: string;
     }> = [];
-    const toolOptions: Array<{ name?: string; optional?: boolean }> = [];
+    const toolOptions: Array<{ name?: string; names?: string[]; optional?: boolean }> = [];
     const api = createTestPluginApi({
       pluginConfig: {
         enabled: true,
@@ -36,6 +36,14 @@ describe("hermes-bridge plugin entry", () => {
     ]);
     expect(toolOptions).toContainEqual({
       name: "hermes_bridge",
+      optional: true,
+    });
+    expect(toolOptions).toContainEqual({
+      names: [
+        "facebook_page_publish_preflight",
+        "facebook_page_graph_status",
+        "facebook_page_graph_publish",
+      ],
       optional: true,
     });
   });

@@ -86,6 +86,21 @@ const AZURE_HOSTNAME_SUFFIXES = [
 
 const DEFAULT_AZURE_OPENAI_API_VERSION = "2024-12-01-preview";
 
+export function sanitizeAiBizWeekPageHeroPrompt(prompt: string): string {
+  if (!/AI\s*BizWeek/i.test(prompt) || !/page[_\s-]*hero/i.test(prompt)) {
+    return prompt;
+  }
+  const sanitized = prompt
+    .split(/\r?\n/)
+    .filter(
+      (line) => !/(?:\bdisclos(?:ure|ed|ing)\b|AI[-\s]*assisted\s+visual|揭露|overlay)/i.test(line),
+    )
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  return sanitized || prompt;
+}
+
 function sanitizeLogValue(value: unknown): string {
   const raw =
     typeof value === "string"
@@ -716,6 +731,7 @@ async function generateOpenAICodexImage(params: {
   apiKey: string;
 }): Promise<ImageGenerationResult> {
   const { req, apiKey } = params;
+  const prompt = sanitizeAiBizWeekPageHeroPrompt(req.prompt);
   const inputImages = req.inputImages ?? [];
   const openAIProviderConfig = req.cfg?.models?.providers?.openai;
   const codexProviderConfig =
@@ -751,7 +767,7 @@ async function generateOpenAICodexImage(params: {
   const outputCompression = resolveOpenAIImageOutputCompression(req, openai);
   headers.set("Content-Type", "application/json");
   const content: Array<Record<string, unknown>> = [
-    { type: "input_text", text: req.prompt },
+    { type: "input_text", text: prompt },
     ...inputImages.map((image) => ({
       type: "input_image",
       image_url: toImageDataUrl({ buffer: image.buffer, mimeType: image.mimeType }),
@@ -850,6 +866,7 @@ export function buildOpenAIImageGenerationProvider(): ImageGenerationProvider {
       return hasCodexResponseTransportProfileConfigured({ agentDir });
     },
     async generateImage(req) {
+      const prompt = sanitizeAiBizWeekPageHeroPrompt(req.prompt);
       const inputImages = req.inputImages ?? [];
       const isEdit = inputImages.length > 0;
       const rawBaseUrl = resolveConfiguredOpenAIBaseUrl(req.cfg);
@@ -964,7 +981,7 @@ export function buildOpenAIImageGenerationProvider(): ImageGenerationProvider {
             if (!isAzure) {
               form.set("model", model);
             }
-            form.set("prompt", req.prompt);
+            form.set("prompt", prompt);
             form.set("n", String(count));
             form.set("size", size);
             appendOpenAIImageOptions(form, req);
@@ -998,7 +1015,7 @@ export function buildOpenAIImageGenerationProvider(): ImageGenerationProvider {
             const jsonHeaders = new Headers(headers);
             jsonHeaders.set("Content-Type", "application/json");
             const body: Record<string, unknown> = {
-              prompt: req.prompt,
+              prompt,
               n: count,
               size,
             };

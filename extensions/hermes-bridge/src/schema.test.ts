@@ -118,6 +118,40 @@ describe("normalizeHermesBridgeRequest", () => {
     });
   });
 
+  it("rejects non-canonical whitespace in Protocol v2 identity.taskType", () => {
+    expect(
+      normalizeHermesBridgeRequest({
+        protocolVersion: "2.0",
+        taskId: "openclaw.agent.loop_contract_start",
+        idempotencyKey: "a-1",
+        identity: {
+          delegationId: "d-1",
+          attemptId: "a-1",
+          contractFingerprint: "sha256:abc",
+          project: "secondhand_commerce",
+          topicId: "2",
+          taskType: "facebook_marketplace_readonly ",
+        },
+        routing: {
+          executorBackend: "openclaw",
+          executorProfile: "loop-contract",
+          backendAgentId: "missioncrew-executor",
+        },
+        policy: {
+          externalEffectBudget: 0,
+          workspacePolicy: "dedicated",
+          sessionPolicy: "ephemeral",
+          credentialRefs: [],
+        },
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: {
+        message: "Protocol v2 identity.taskType must be a canonical string.",
+      },
+    });
+  });
+
   it("fails closed without taskId", () => {
     expect(normalizeHermesBridgeRequest({ input: {} })).toMatchObject({
       ok: false,
