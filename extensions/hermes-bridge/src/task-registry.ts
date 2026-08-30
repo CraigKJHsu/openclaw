@@ -54,6 +54,14 @@ const ZERO_EFFECT_EXTERNAL_TARGET_TASK_TYPES = new Set([
   "secondhand_commerce_group_status",
 ]);
 const CLEANUP_SETTLE_BUFFER_MS = 90_000;
+const USAGE_LIMIT_PATTERNS = [
+  "codex subscription usage limit",
+  "usage limit",
+  "quota",
+  "rate limit",
+  "rate-limit",
+  "rate_limit",
+] as const;
 
 function isForeignSessionCleanupOwnershipError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
@@ -80,6 +88,52 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
 function readString(input: Record<string, unknown> | undefined, key: string): string | undefined {
   const value = input?.[key];
   return typeof value === "string" ? value : undefined;
+}
+
+function usageLimitMessageFromUnknown(value: unknown): string | undefined {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text && USAGE_LIMIT_PATTERNS.some((pattern) => text.toLowerCase().includes(pattern))) {
+      return text;
+    }
+    return undefined;
+  }
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const message = usageLimitMessageFromUnknown(item);
+      if (message) {
+        return message;
+      }
+    }
+    return undefined;
+  }
+  const record = asRecord(value);
+  if (!record) {
+    return undefined;
+  }
+  for (const key of [
+    "promptError",
+    "prompt_error",
+    "fallbackStepFromFailureDetail",
+    "fallbackStepFromFailureReason",
+    "modelError",
+    "model_error",
+    "error",
+    "message",
+    "summary",
+  ]) {
+    const message = usageLimitMessageFromUnknown(record[key]);
+    if (message) {
+      return message;
+    }
+  }
+  for (const item of Object.values(record)) {
+    const message = usageLimitMessageFromUnknown(item);
+    if (message) {
+      return message;
+    }
+  }
+  return undefined;
 }
 
 function readUsageCount(value: unknown): number | undefined {
@@ -830,6 +884,30 @@ export function auditLoopContractResult(
     };
   }
   return { ok: true, parsed };
+}
+
+function loopContractUsageLimitResult(
+  request: HermesBridgeRequest,
+  message: string,
+): Record<string, unknown> {
+  return {
+    status: "blocked",
+    summary: `OpenClaw Loop Contract blocked before execution because the Codex usage limit was reached: ${message}`,
+    acceptanceEvidence: [
+      {
+        kind: "runtime_blocker",
+        reason: "codex_usage_limit",
+        message,
+      },
+    ],
+    externalEffects: [],
+    blocker: {
+      kind: "quota_blocked",
+      reason: "codex_usage_limit",
+      message,
+      externalEffectBudget: request.policy.externalEffectBudget,
+    },
+  };
 }
 
 function isInternalImageGenerationEffect(rawEffect: unknown): boolean {
@@ -2769,6 +2847,8 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         audited.ok;
       const tokenUsage =
         tokenUsageFromMessages(transcript.messages) ?? tokenUsageFromUnknown(wait, "openclaw-wait");
+      const usageLimitMessage =
+        usageLimitMessageFromUnknown(wait) ?? usageLimitMessageFromUnknown(transcript.messages);
       let sessionCleaned = request.policy.sessionPolicy !== "ephemeral";
       let cleanupWarning: string | undefined;
       if (request.policy.sessionPolicy === "ephemeral") {
@@ -2784,6 +2864,36 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         }
       }
       revokeFacebookPageCapability(backendSessionKey, config);
+      if (usageLimitMessage) {
+        const blockedResult = loopContractUsageLimitResult(request, usageLimitMessage);
+        return {
+          bridgeStatus: "blocked",
+          bridgeSummary:
+            "OpenClaw Loop Contract blocked before execution because the Codex usage limit was reached.",
+          backendExecution: {
+            executorBackend: "openclaw" as const,
+            backendRunId,
+            backendAgentId: validated.agentId,
+            sessionKey: backendSessionKey,
+          },
+          ...(tokenUsage ? { tokenUsage } : {}),
+          evidence: {
+            terminal: true,
+            transcriptMessageCount: transcript.messages.length,
+            sessionCleaned,
+            ...(cleanupWarning ? { cleanupWarning } : {}),
+            ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
+            ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
+            toolsAllowed: request.allowedTools,
+            externalEffectBudget: request.policy.externalEffectBudget,
+            resultContractValid: true,
+            runtimeBlocker: "codex_usage_limit",
+            promptError: usageLimitMessage,
+          },
+          resultText: JSON.stringify(blockedResult),
+          result: blockedResult,
+        };
+      }
       return {
         bridgeStatus: succeeded ? "succeeded" : "failed",
         bridgeSummary: succeeded

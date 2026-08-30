@@ -237,11 +237,7 @@ function imageGenerationLoopRequest() {
           non_goals: ["external publishing"],
         },
         scope: {
-          allowed: [
-            "missioncrew-content",
-            "image_generate",
-            "openai/gpt-image-2",
-          ],
+          allowed: ["missioncrew-content", "image_generate", "openai/gpt-image-2"],
           forbidden: ["clawops-content", "Hermes legacy"],
         },
         routing: {
@@ -547,6 +543,87 @@ describe("executeHermesBridgeTask", () => {
         result: terminalResult,
       },
     });
+    expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
+  });
+
+  it("returns a structured quota blocker when a Loop Contract run hits Codex usage limits", async () => {
+    const startRequest = readonlyMarketplaceLoopRequest();
+    const identityHash = createHash("sha256")
+      .update(
+        [
+          startRequest.identity.delegationId,
+          startRequest.identity.attemptId,
+          startRequest.identity.contractFingerprint,
+          startRequest.idempotencyKey,
+        ].join("\0"),
+      )
+      .digest("hex")
+      .slice(0, 24);
+    const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${identityHash}`;
+    const usageMessage =
+      "You've reached your Codex subscription usage limit. Next reset in 3 days, Sep 1 at 9:56 PM GMT+8.";
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn().mockResolvedValue({
+        status: "error",
+        terminal: true,
+        promptError: usageMessage,
+      }),
+      getSessionMessages: vi.fn().mockResolvedValue({ messages: [] }),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+    const pollRequest = request({
+      ...startRequest,
+      taskId: "openclaw.agent.loop_contract_poll",
+      idempotencyKey: "marketplace-readonly-start:poll:quota",
+      input: {
+        ...startRequest.input,
+        startIdempotencyKey: "marketplace-readonly-start",
+        backendRunId: "marketplace-readonly-run",
+        backendSessionKey: sessionKey,
+      },
+    });
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_poll"],
+        allowedTools: ["read", "web_search", "browser"],
+      }),
+      request: pollRequest,
+      subagent,
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({
+      ok: true,
+      status: "blocked",
+      output: {
+        bridgeStatus: "blocked",
+        evidence: {
+          terminal: true,
+          resultContractValid: true,
+          runtimeBlocker: "codex_usage_limit",
+          promptError: usageMessage,
+        },
+        result: {
+          status: "blocked",
+          blocker: {
+            kind: "quota_blocked",
+            reason: "codex_usage_limit",
+          },
+          externalEffects: [],
+        },
+      },
+    });
+    expect(JSON.parse(String((result.output as Record<string, unknown>).resultText))).toMatchObject(
+      {
+        status: "blocked",
+        blocker: { reason: "codex_usage_limit" },
+      },
+    );
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
   });
 
