@@ -630,8 +630,9 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
   const requestedAgentId = request.routing.backendAgentId?.trim();
   const modelRoute = request.routing.modelRoute;
   const missionCrewRoutingV1Sha256 =
-    "4f8024f14e0d740e8761de60e0ff3047a42b760d421cc4e676400a979b41f572";
+    "380b6f68322e310ff3e800c5d022ebd7997de1242be005b6ae69c74a31e53885";
   const allowedModels = new Set([
+    "gpt-5.5",
     "gpt-5.6-sol",
     "gpt-5.6-terra",
     "gpt-5.6-luna",
@@ -641,6 +642,7 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
   // agent layer outside the ClawOps/Kanban evidence and receipt boundary.
   // This allowlist is therefore narrower than each model's platform capability.
   const allowedThinkingByModel = new Map<string, ReadonlySet<string>>([
+    ["gpt-5.5", new Set(["low", "medium", "high", "xhigh"])],
     ["gpt-5.6-sol", new Set(["low", "medium", "high", "xhigh", "max"])],
     ["gpt-5.6-terra", new Set(["low", "medium", "high", "xhigh", "max"])],
     ["gpt-5.6-luna", new Set(["low", "medium", "high", "xhigh", "max"])],
