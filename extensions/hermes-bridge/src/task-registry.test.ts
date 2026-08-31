@@ -139,6 +139,44 @@ describe("auditLoopContractResult", () => {
 
     expect(result.ok).toBe(true);
   });
+
+  it("accepts credentialed readonly chooser scans with no external effects", () => {
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        summary:
+          "Zero-effect readonly chooser scan completed. No eligible allowlist entries were produced because exact numeric group IDs were not available, so the report is incomplete rather than guessed.",
+        acceptanceEvidence: {
+          sourceAliasReadback: {
+            public_listing_id: "37276725125275496",
+            management_listing_id: "915975414881937",
+            verified: true,
+          },
+          eligibleCandidates: [],
+          rejectedOptions: [
+            {
+              canonical_name:
+                "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
+              reason: "visible in chooser but no exact numeric group ID exposed",
+            },
+          ],
+          coverage: {
+            scanned_count: 57,
+            eligible_count: 0,
+            ineligible_count: 57,
+            complete: false,
+          },
+          zeroExternalEffectConfirmation: {
+            verified: true,
+          },
+        },
+        externalEffects: [],
+      }),
+      request(),
+    );
+
+    expect(result.ok).toBe(true);
+  });
 });
 
 describe("sanitizeLoopContractForPrompt", () => {

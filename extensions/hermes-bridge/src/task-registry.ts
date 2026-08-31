@@ -991,7 +991,11 @@ function hasZeroEffectBlockerText(value: unknown): boolean {
   const text = value.toLowerCase();
   return (
     text.includes("zero-effect blocker") ||
+    text.includes("zero-effect readonly") ||
+    text.includes("readonly chooser scan") ||
     text.includes("blocked") ||
+    text.includes("incomplete") ||
+    text.includes("no eligible allowlist") ||
     text.includes("stopped before") ||
     text.includes("no external write") ||
     text.includes("no facebook submit") ||
