@@ -951,21 +951,52 @@ function hasSafeZeroEffectBlocker(
   if (!acceptance) {
     return false;
   }
-  const blocker = acceptance.blocker;
+  const blocker = acceptance.blocker ?? parsed.blocker;
   const hasBlocker =
-    (typeof blocker === "string" && Boolean(blocker.trim())) ||
-    Boolean(asRecord(blocker) && Object.keys(asRecord(blocker)!).length > 0);
+    hasNonEmptyEvidence(blocker) ||
+    hasZeroEffectBlockerText(parsed.summary) ||
+    hasZeroEffectBlockerText(acceptance.summary) ||
+    hasZeroEffectBlockerText(acceptance.reason);
   const coverage = asRecord(acceptance.coverage);
   const attemptedCount = Number(coverage?.attempted_count);
   const blockedCount = Number(coverage?.blocked_count);
-  return (
-    hasBlocker &&
+  const hasBlockingCoverage =
     Boolean(coverage) &&
     Number.isFinite(attemptedCount) &&
     attemptedCount === 0 &&
     Number.isFinite(blockedCount) &&
     blockedCount > 0 &&
-    coverage?.complete === false
+    coverage?.complete === false;
+  const hasStructuredEvidence = Object.keys(acceptance).some((key) =>
+    hasNonEmptyEvidence(acceptance[key]),
+  );
+  return hasBlocker && (hasBlockingCoverage || hasStructuredEvidence);
+}
+
+function hasNonEmptyEvidence(value: unknown): boolean {
+  if (typeof value === "string") {
+    return Boolean(value.trim());
+  }
+  const record = asRecord(value);
+  if (record) {
+    return Object.keys(record).length > 0;
+  }
+  return Array.isArray(value) && value.length > 0;
+}
+
+function hasZeroEffectBlockerText(value: unknown): boolean {
+  if (typeof value !== "string") {
+    return false;
+  }
+  const text = value.toLowerCase();
+  return (
+    text.includes("zero-effect blocker") ||
+    text.includes("blocked") ||
+    text.includes("stopped before") ||
+    text.includes("no external write") ||
+    text.includes("no facebook submit") ||
+    text.includes("no facebook") ||
+    text.includes("forbidden")
   );
 }
 

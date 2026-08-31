@@ -117,6 +117,28 @@ describe("auditLoopContractResult", () => {
 
     expect(result.ok).toBe(true);
   });
+
+  it("accepts source identity conflict as safe zero-effect external blocker evidence", () => {
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        summary:
+          "Zero-effect blocker report produced. The live owner/management identifiers resolve to forbidden listing id 915975414881937. I stopped before any distribution write. No Facebook submit/post action was performed.",
+        acceptanceEvidence: {
+          sourceListingReadback: {
+            requestedSourceListingId: "37276725125275496",
+            requestedUrl: "https://www.facebook.com/marketplace/item/37276725125275496/",
+            liveReadback:
+              "The item page displays Kolin KD-291M06, but edit/listing management links expose listing_id=915975414881937.",
+          },
+        },
+        externalEffects: [],
+      }),
+      request(),
+    );
+
+    expect(result.ok).toBe(true);
+  });
 });
 
 describe("sanitizeLoopContractForPrompt", () => {
