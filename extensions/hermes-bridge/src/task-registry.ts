@@ -954,11 +954,13 @@ function loopContractInvalidTerminalResult(
   params: {
     reason: string;
     backendRunStatus: string;
+    backendError?: string;
     resultText: string;
     transcriptMessageCount: number;
   },
 ): Record<string, unknown> {
   const excerpt = params.resultText.trim().slice(0, 1_000);
+  const backendError = params.backendError?.trim();
   return {
     status: "blocked",
     summary: `OpenClaw Loop Contract reached a terminal state, but its result could not be accepted: ${params.reason}`,
@@ -969,6 +971,7 @@ function loopContractInvalidTerminalResult(
         message: params.reason,
         backendRunStatus: params.backendRunStatus,
         transcriptMessageCount: params.transcriptMessageCount,
+        ...(backendError ? { backendError } : {}),
         ...(excerpt ? { resultTextExcerpt: excerpt } : {}),
       },
     ],
@@ -979,6 +982,7 @@ function loopContractInvalidTerminalResult(
       message: params.reason,
       backendRunStatus: params.backendRunStatus,
       transcriptMessageCount: params.transcriptMessageCount,
+      ...(backendError ? { backendError } : {}),
       externalEffectBudget: request.policy.externalEffectBudget,
     },
   };
@@ -2986,6 +2990,7 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         const blockedResult = loopContractInvalidTerminalResult(request, {
           reason: audited.reason ?? "Loop Contract result did not satisfy the acceptance contract.",
           backendRunStatus: wait.status,
+          backendError: wait.error,
           resultText,
           transcriptMessageCount: transcript.messages.length,
         });
@@ -3012,6 +3017,15 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
             resultContractValid: true,
             resultContractError: audited.reason,
             runtimeBlocker: "invalid_terminal_result",
+            backendRunStatus: wait.status,
+            ...(wait.error ? { backendError: wait.error } : {}),
+            ...(validated.model
+              ? {
+                  requestedProvider: validated.provider,
+                  requestedModel: validated.model,
+                  requestedThinking: validated.thinking,
+                }
+              : {}),
           },
           resultText: JSON.stringify(blockedResult),
           result: blockedResult,
@@ -3038,6 +3052,15 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           externalEffectBudget: request.policy.externalEffectBudget,
           resultContractValid: audited.ok,
           resultContractError: audited.reason,
+          backendRunStatus: wait.status,
+          ...(wait.error ? { backendError: wait.error } : {}),
+          ...(validated.model
+            ? {
+                requestedProvider: validated.provider,
+                requestedModel: validated.model,
+                requestedThinking: validated.thinking,
+              }
+            : {}),
         },
         resultText,
         result: audited.parsed,

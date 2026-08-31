@@ -747,7 +747,11 @@ describe("executeHermesBridgeTask", () => {
     const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${identityHash}`;
     const subagent = {
       run: vi.fn(),
-      waitForRun: vi.fn().mockResolvedValue({ status: "error", terminal: true }),
+      waitForRun: vi.fn().mockResolvedValue({
+        status: "error",
+        terminal: true,
+        error: "Codex runtime ended before producing a Loop Contract result.",
+      }),
       getSessionMessages: vi.fn().mockResolvedValue({ messages: [] }),
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
@@ -787,6 +791,11 @@ describe("executeHermesBridgeTask", () => {
           resultContractValid: true,
           resultContractError: "Loop Contract result is empty or missing.",
           runtimeBlocker: "invalid_terminal_result",
+          backendRunStatus: "error",
+          backendError: "Codex runtime ended before producing a Loop Contract result.",
+          requestedProvider: "codex",
+          requestedModel: "gpt-5.6-terra",
+          requestedThinking: "medium",
         },
         result: {
           status: "blocked",
@@ -794,6 +803,7 @@ describe("executeHermesBridgeTask", () => {
             kind: "runtime_blocked",
             reason: "invalid_terminal_result",
             message: "Loop Contract result is empty or missing.",
+            backendError: "Codex runtime ended before producing a Loop Contract result.",
           },
           externalEffects: [],
         },
