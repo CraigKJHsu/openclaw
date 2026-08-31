@@ -635,6 +635,7 @@ export function createGatewaySubagentRuntime(): PluginRuntime["subagent"] {
           deliver: params.deliver ?? false,
           ...(allowOverride && params.provider && { provider: params.provider }),
           ...(allowOverride && params.model && { model: params.model }),
+          ...(allowOverride && params.thinking && { thinking: params.thinking }),
           ...(params.extraSystemPrompt && { extraSystemPrompt: params.extraSystemPrompt }),
           ...(params.lane && { lane: params.lane }),
           ...(params.lightContext === true && { bootstrapContextMode: "lightweight" }),

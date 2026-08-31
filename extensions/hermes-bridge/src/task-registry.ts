@@ -620,11 +620,31 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
   idempotencyKey: string;
   sessionKey: string;
   loopContract: Record<string, unknown>;
+  model?: string;
+  thinking?: string;
 } {
   const input = normalizeRequestInput(request);
   const loopContract = asRecord(input.loopContract);
   const startIdempotencyKey = readString(input, "startIdempotencyKey")?.trim();
   const requestedAgentId = request.routing.backendAgentId?.trim();
+  const modelRoute = request.routing.modelRoute;
+  const missionCrewRoutingV1Sha256 =
+    "4f8024f14e0d740e8761de60e0ff3047a42b760d421cc4e676400a979b41f572";
+  const allowedModels = new Set([
+    "gpt-5.6-sol",
+    "gpt-5.6-terra",
+    "gpt-5.6-luna",
+    "gpt-5.3-codex-spark",
+  ]);
+  // MissionCrew policy intentionally excludes `ultra`: Ultra may create an
+  // agent layer outside the ClawOps/Kanban evidence and receipt boundary.
+  // This allowlist is therefore narrower than each model's platform capability.
+  const allowedThinkingByModel = new Map<string, ReadonlySet<string>>([
+    ["gpt-5.6-sol", new Set(["low", "medium", "high", "xhigh", "max"])],
+    ["gpt-5.6-terra", new Set(["low", "medium", "high", "xhigh", "max"])],
+    ["gpt-5.6-luna", new Set(["low", "medium", "high", "xhigh", "max"])],
+    ["gpt-5.3-codex-spark", new Set(["low", "medium", "high", "xhigh"])],
+  ]);
   if (
     request.protocolVersion !== "2.0" ||
     !request.identity.delegationId ||
@@ -639,7 +659,15 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
     request.requiresConfirmation ||
     request.dryRun ||
     !request.idempotencyKey ||
-    !loopContract
+    !loopContract ||
+    (modelRoute != null &&
+      (!allowedModels.has(modelRoute.requested_model) ||
+        !allowedThinkingByModel
+          .get(modelRoute.requested_model)
+          ?.has(modelRoute.reasoning_effort) ||
+        modelRoute.reasoning_mode !== "standard" ||
+        modelRoute.policy_id !== "missioncrew-model-routing-v1" ||
+        modelRoute.policy_sha256 !== missionCrewRoutingV1Sha256))
   ) {
     throw new Error(
       "Loop Contract execution requires fixed Protocol v2 OpenClaw routing, a durable identity, dedicated workspace, and an embedded validated contract.",
@@ -747,6 +775,9 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
     idempotencyKey: request.idempotencyKey,
     sessionKey: `agent:${requestedAgentId}:subagent:hermes-loop-${identityHash}`,
     loopContract: sanitizedContract,
+    ...(modelRoute
+      ? { model: modelRoute.requested_model, thinking: modelRoute.reasoning_effort }
+      : {}),
   };
 }
 
@@ -2755,6 +2786,9 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
       try {
         run = await subagent.run({
           sessionKey: validated.sessionKey,
+          ...(validated.model
+            ? { model: validated.model, thinking: validated.thinking }
+            : {}),
           toolsAllow: request.allowedTools,
           disableTools: request.allowedTools.length === 0,
           message: [
@@ -2801,6 +2835,12 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           externalEffectBudget: request.policy.externalEffectBudget,
           toolsAllowed: request.allowedTools,
           terminal: false,
+          ...(validated.model
+            ? {
+                requestedModel: validated.model,
+                requestedThinking: validated.thinking,
+              }
+            : {}),
         },
       };
     },

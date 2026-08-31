@@ -13,6 +13,7 @@ export type SubagentRunParams = {
   message: string;
   provider?: string;
   model?: string;
+  thinking?: string;
   extraSystemPrompt?: string;
   lane?: string;
   lightContext?: boolean;

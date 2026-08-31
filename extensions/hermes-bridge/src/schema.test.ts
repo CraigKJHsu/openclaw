@@ -2,6 +2,18 @@ import { describe, expect, it } from "vitest";
 import { normalizeHermesBridgeRequest } from "./schema.js";
 
 describe("normalizeHermesBridgeRequest", () => {
+  it("rejects a present but incomplete model route", () => {
+    expect(
+      normalizeHermesBridgeRequest({
+        taskId: "status.echo",
+        routing: { modelRoute: { requested_model: "gpt-5.6-terra" } },
+      }),
+    ).toMatchObject({
+      ok: false,
+      error: { type: "invalid_request", message: expect.stringContaining("modelRoute") },
+    });
+  });
+
   it("normalizes Hermes delegation requests with safe defaults", () => {
     expect(
       normalizeHermesBridgeRequest({
@@ -53,6 +65,13 @@ describe("normalizeHermesBridgeRequest", () => {
           executorBackend: "openclaw",
           executorProfile: "browser-readonly",
           backendAgentId: "missioncrew-browser-readonly",
+          modelRoute: {
+            requested_model: "gpt-5.6-luna",
+            reasoning_effort: "low",
+            reasoning_mode: "standard",
+            policy_id: "missioncrew-model-routing-v1",
+            policy_sha256: "a".repeat(64),
+          },
         },
         policy: {
           externalEffectBudget: 0,
@@ -76,6 +95,13 @@ describe("normalizeHermesBridgeRequest", () => {
           executorBackend: "openclaw",
           executorProfile: "browser-readonly",
           backendAgentId: "missioncrew-browser-readonly",
+          modelRoute: {
+            requested_model: "gpt-5.6-luna",
+            reasoning_effort: "low",
+            reasoning_mode: "standard",
+            policy_id: "missioncrew-model-routing-v1",
+            policy_sha256: "a".repeat(64),
+          },
         },
         policy: {
           externalEffectBudget: 0,

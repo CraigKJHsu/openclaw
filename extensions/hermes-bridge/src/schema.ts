@@ -14,6 +14,15 @@ export type HermesBridgeExecutionRouting = {
   executorBackend?: "codex" | "hermes" | "openclaw";
   executorProfile?: string;
   backendAgentId?: string;
+  modelRoute?: HermesBridgeModelRoute;
+};
+
+export type HermesBridgeModelRoute = {
+  requested_model: string;
+  reasoning_effort: string;
+  reasoning_mode: string;
+  policy_id: string;
+  policy_sha256: string;
 };
 
 export type HermesBridgeExecutionPolicy = {
@@ -167,10 +176,23 @@ export function normalizeHermesBridgeRequest(raw: unknown): HermesBridgeValidati
   const record = readObject(raw);
   const identity = readObject(record.identity);
   const routing = readObject(record.routing);
+  const modelRoute = readObject(routing.modelRoute);
   const policy = readObject(record.policy);
   const taskId = readString(record.taskId);
   if (!taskId) {
     return invalidRequest("Hermes bridge request requires a string taskId.");
+  }
+  if (
+    Object.hasOwn(routing, "modelRoute") &&
+    (!readString(modelRoute.requested_model) ||
+      !readString(modelRoute.reasoning_effort) ||
+      !readString(modelRoute.reasoning_mode) ||
+      !readString(modelRoute.policy_id) ||
+      !readString(modelRoute.policy_sha256))
+  ) {
+    return invalidRequest(
+      "Hermes bridge routing.modelRoute must contain every required policy field.",
+    );
   }
   if (
     Object.hasOwn(record, "protocolVersion") &&
@@ -270,6 +292,21 @@ export function normalizeHermesBridgeRequest(raw: unknown): HermesBridgeValidati
           : {}),
         ...(readString(routing.backendAgentId)
           ? { backendAgentId: readString(routing.backendAgentId) }
+          : {}),
+        ...(readString(modelRoute.requested_model) &&
+        readString(modelRoute.reasoning_effort) &&
+        readString(modelRoute.reasoning_mode) &&
+        readString(modelRoute.policy_id) &&
+        readString(modelRoute.policy_sha256)
+          ? {
+              modelRoute: {
+                requested_model: readString(modelRoute.requested_model)!,
+                reasoning_effort: readString(modelRoute.reasoning_effort)!,
+                reasoning_mode: readString(modelRoute.reasoning_mode)!,
+                policy_id: readString(modelRoute.policy_id)!,
+                policy_sha256: readString(modelRoute.policy_sha256)!,
+              },
+            }
           : {}),
       },
       policy: {

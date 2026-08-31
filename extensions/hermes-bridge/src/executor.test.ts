@@ -264,6 +264,13 @@ function imageGenerationLoopRequest() {
       executorBackend: "openclaw",
       executorProfile: "loop-contract",
       backendAgentId: "missioncrew-content",
+      modelRoute: {
+        requested_model: "gpt-5.3-codex-spark",
+        reasoning_effort: "low",
+        reasoning_mode: "standard",
+        policy_id: "missioncrew-model-routing-v1",
+        policy_sha256: "4f8024f14e0d740e8761de60e0ff3047a42b760d421cc4e676400a979b41f572",
+      },
     },
     policy: {
       externalEffectBudget: 0,
@@ -441,12 +448,16 @@ describe("executeHermesBridgeTask", () => {
           externalEffectBudget: 0,
           toolsAllowed: ["read", "write", "web_search", "image_generate"],
           terminal: false,
+          requestedModel: "gpt-5.3-codex-spark",
+          requestedThinking: "low",
         },
       },
     });
     expect(subagent.run).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionKey: expect.stringContaining("agent:missioncrew-content:subagent:hermes-loop-"),
+        model: "gpt-5.3-codex-spark",
+        thinking: "low",
         toolsAllow: ["read", "write", "web_search", "image_generate"],
         message: expect.stringContaining("Do not report blocked solely because status is running"),
       }),
@@ -455,6 +466,97 @@ describe("executeHermesBridgeTask", () => {
     expect(prompt).toContain("Carter Page body source text.");
     expect(prompt).toContain("Complete Carter Page Hero policy content: exact 4:5.");
     expect(prompt).toContain("Complete Audio Brief policy content: fixed eight-zone 1:1.");
+  });
+
+  it("rejects reasoning efforts unsupported by the selected model", async () => {
+    const request = imageGenerationLoopRequest();
+    if (!request.routing.modelRoute) {
+      throw new Error("test fixture must include a model route");
+    }
+    request.routing.modelRoute.reasoning_effort = "max";
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_start"],
+        allowedTools: ["read", "write", "web_search", "image_generate"],
+      }),
+      request,
+      subagent,
+    });
+
+    expect(result).toMatchObject({ ok: false, status: "failed" });
+    expect(subagent.run).not.toHaveBeenCalled();
+  });
+
+  it("rejects Ultra even when the selected model supports it", async () => {
+    const request = imageGenerationLoopRequest();
+    if (!request.routing.modelRoute) {
+      throw new Error("test fixture must include a model route");
+    }
+    request.routing.modelRoute.requested_model = "gpt-5.6-sol";
+    request.routing.modelRoute.reasoning_effort = "ultra";
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_start"],
+        allowedTools: ["read", "write", "web_search", "image_generate"],
+      }),
+      request,
+      subagent,
+    });
+
+    expect(result).toMatchObject({ ok: false, status: "failed" });
+    expect(subagent.run).not.toHaveBeenCalled();
+  });
+
+  it("rejects a self-asserted routing-policy digest", async () => {
+    const request = imageGenerationLoopRequest();
+    if (!request.routing.modelRoute) {
+      throw new Error("test fixture must include a model route");
+    }
+    request.routing.modelRoute.policy_sha256 = "a".repeat(64);
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_start"],
+        allowedTools: ["read", "write", "web_search", "image_generate"],
+      }),
+      request,
+      subagent,
+    });
+
+    expect(result).toMatchObject({ ok: false, status: "failed" });
+    expect(subagent.run).not.toHaveBeenCalled();
   });
 
   it("keeps terminal missioncrew-content Loop Contract evidence when restored session cleanup is foreign-owned", async () => {
