@@ -826,6 +826,9 @@ export function auditLoopContractResult(
   resultText: string,
   request: HermesBridgeRequest,
 ): { ok: boolean; parsed?: Record<string, unknown>; reason?: string } {
+  if (!resultText.trim()) {
+    return { ok: false, reason: "Loop Contract result is empty or missing." };
+  }
   let parsed: Record<string, unknown> | undefined;
   try {
     parsed = asRecord(JSON.parse(resultText));
@@ -905,6 +908,41 @@ function loopContractUsageLimitResult(
       kind: "quota_blocked",
       reason: "codex_usage_limit",
       message,
+      externalEffectBudget: request.policy.externalEffectBudget,
+    },
+  };
+}
+
+function loopContractInvalidTerminalResult(
+  request: HermesBridgeRequest,
+  params: {
+    reason: string;
+    backendRunStatus: string;
+    resultText: string;
+    transcriptMessageCount: number;
+  },
+): Record<string, unknown> {
+  const excerpt = params.resultText.trim().slice(0, 1_000);
+  return {
+    status: "blocked",
+    summary: `OpenClaw Loop Contract reached a terminal state, but its result could not be accepted: ${params.reason}`,
+    acceptanceEvidence: [
+      {
+        kind: "runtime_blocker",
+        reason: "invalid_terminal_result",
+        message: params.reason,
+        backendRunStatus: params.backendRunStatus,
+        transcriptMessageCount: params.transcriptMessageCount,
+        ...(excerpt ? { resultTextExcerpt: excerpt } : {}),
+      },
+    ],
+    externalEffects: [],
+    blocker: {
+      kind: "runtime_blocked",
+      reason: "invalid_terminal_result",
+      message: params.reason,
+      backendRunStatus: params.backendRunStatus,
+      transcriptMessageCount: params.transcriptMessageCount,
       externalEffectBudget: request.policy.externalEffectBudget,
     },
   };
@@ -2894,11 +2932,44 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           result: blockedResult,
         };
       }
+      if (!succeeded) {
+        const blockedResult = loopContractInvalidTerminalResult(request, {
+          reason: audited.reason ?? "Loop Contract result did not satisfy the acceptance contract.",
+          backendRunStatus: wait.status,
+          resultText,
+          transcriptMessageCount: transcript.messages.length,
+        });
+        return {
+          bridgeStatus: "blocked",
+          bridgeSummary:
+            "OpenClaw Loop Contract was blocked after terminal execution because the worker returned an invalid result contract.",
+          backendExecution: {
+            executorBackend: "openclaw" as const,
+            backendRunId,
+            backendAgentId: validated.agentId,
+            sessionKey: backendSessionKey,
+          },
+          ...(tokenUsage ? { tokenUsage } : {}),
+          evidence: {
+            terminal: true,
+            transcriptMessageCount: transcript.messages.length,
+            sessionCleaned,
+            ...(cleanupWarning ? { cleanupWarning } : {}),
+            ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
+            ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
+            toolsAllowed: request.allowedTools,
+            externalEffectBudget: request.policy.externalEffectBudget,
+            resultContractValid: true,
+            resultContractError: audited.reason,
+            runtimeBlocker: "invalid_terminal_result",
+          },
+          resultText: JSON.stringify(blockedResult),
+          result: blockedResult,
+        };
+      }
       return {
-        bridgeStatus: succeeded ? "succeeded" : "failed",
-        bridgeSummary: succeeded
-          ? "OpenClaw Loop Contract execution completed."
-          : `OpenClaw Loop Contract run ended with status=${wait.status}.`,
+        bridgeStatus: "succeeded",
+        bridgeSummary: "OpenClaw Loop Contract execution completed.",
         backendExecution: {
           executorBackend: "openclaw" as const,
           backendRunId,

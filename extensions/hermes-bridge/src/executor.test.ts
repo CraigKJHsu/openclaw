@@ -627,6 +627,86 @@ describe("executeHermesBridgeTask", () => {
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
   });
 
+  it("returns a structured blocker when a terminal Loop Contract has no result text", async () => {
+    const startRequest = readonlyMarketplaceLoopRequest();
+    const identityHash = createHash("sha256")
+      .update(
+        [
+          startRequest.identity.delegationId,
+          startRequest.identity.attemptId,
+          startRequest.identity.contractFingerprint,
+          startRequest.idempotencyKey,
+        ].join("\0"),
+      )
+      .digest("hex")
+      .slice(0, 24);
+    const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${identityHash}`;
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn().mockResolvedValue({ status: "error", terminal: true }),
+      getSessionMessages: vi.fn().mockResolvedValue({ messages: [] }),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+    const pollRequest = request({
+      ...startRequest,
+      taskId: "openclaw.agent.loop_contract_poll",
+      idempotencyKey: "marketplace-readonly-start:poll:empty-terminal-result",
+      input: {
+        ...startRequest.input,
+        startIdempotencyKey: "marketplace-readonly-start",
+        backendRunId: "marketplace-readonly-run",
+        backendSessionKey: sessionKey,
+      },
+    });
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_poll"],
+        allowedTools: ["read", "web_search", "browser"],
+      }),
+      request: pollRequest,
+      subagent,
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({
+      ok: true,
+      status: "blocked",
+      output: {
+        bridgeStatus: "blocked",
+        evidence: {
+          terminal: true,
+          transcriptMessageCount: 0,
+          resultContractValid: true,
+          resultContractError: "Loop Contract result is empty or missing.",
+          runtimeBlocker: "invalid_terminal_result",
+        },
+        result: {
+          status: "blocked",
+          blocker: {
+            kind: "runtime_blocked",
+            reason: "invalid_terminal_result",
+            message: "Loop Contract result is empty or missing.",
+          },
+          externalEffects: [],
+        },
+      },
+    });
+    expect(JSON.parse(String((result.output as Record<string, unknown>).resultText))).toMatchObject(
+      {
+        status: "blocked",
+        blocker: {
+          reason: "invalid_terminal_result",
+          message: "Loop Contract result is empty or missing.",
+        },
+      },
+    );
+    expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
+  });
+
   it("accepts local image generation receipts without consuming external effect budget", async () => {
     const startRequest = imageGenerationLoopRequest();
     const identityHash = createHash("sha256")
