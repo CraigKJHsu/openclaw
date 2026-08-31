@@ -880,7 +880,9 @@ export function auditLoopContractResult(
   if (!parsed) {
     return { ok: false, reason: "Loop Contract result must be a JSON object." };
   }
-  if (readString(parsed, "status") !== "succeeded") {
+  const status = readString(parsed, "status");
+  const safeZeroEffectBlocker = hasSafeZeroEffectBlocker(parsed, request);
+  if (status !== "succeeded" && !(status === "blocked" && safeZeroEffectBlocker)) {
     return { ok: false, reason: "Loop Contract result did not declare status=succeeded." };
   }
   const effects = parsed.externalEffects;
@@ -923,12 +925,48 @@ export function auditLoopContractResult(
     }
   }
   if (request.policy.externalEffectBudget > 0 && externalEffects.length === 0) {
+    if (safeZeroEffectBlocker) {
+      return { ok: true, parsed };
+    }
     return {
       ok: false,
       reason: "External-effect Loop Contract returned no verified effect evidence.",
     };
   }
   return { ok: true, parsed };
+}
+
+function hasSafeZeroEffectBlocker(
+  parsed: Record<string, unknown>,
+  request: HermesBridgeRequest,
+): boolean {
+  if (request.policy.externalEffectBudget <= 0) {
+    return false;
+  }
+  const effects = parsed.externalEffects;
+  if (!Array.isArray(effects) || effects.some((effect) => !isInternalImageGenerationEffect(effect))) {
+    return false;
+  }
+  const acceptance = asRecord(parsed.acceptanceEvidence);
+  if (!acceptance) {
+    return false;
+  }
+  const blocker = acceptance.blocker;
+  const hasBlocker =
+    (typeof blocker === "string" && Boolean(blocker.trim())) ||
+    Boolean(asRecord(blocker) && Object.keys(asRecord(blocker)!).length > 0);
+  const coverage = asRecord(acceptance.coverage);
+  const attemptedCount = Number(coverage?.attempted_count);
+  const blockedCount = Number(coverage?.blocked_count);
+  return (
+    hasBlocker &&
+    Boolean(coverage) &&
+    Number.isFinite(attemptedCount) &&
+    attemptedCount === 0 &&
+    Number.isFinite(blockedCount) &&
+    blockedCount > 0 &&
+    coverage?.complete === false
+  );
 }
 
 function loopContractUsageLimitResult(

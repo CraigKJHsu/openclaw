@@ -82,6 +82,41 @@ describe("auditLoopContractResult", () => {
       reason: "Loop Contract external effect evidence is incomplete or outside the approved targets.",
     });
   });
+
+  it("accepts a safe zero-effect external blocker report", () => {
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        summary:
+          "blocked: the live management dialog resolved to a forbidden listing id, so no external write was performed.",
+        acceptanceEvidence: {
+          blocker:
+            "The listing-bound management dialog resolved to a forbidden listing id.",
+          coverage: {
+            expected_total: 16,
+            named_count: 16,
+            attempted_count: 0,
+            success_or_submitted_count: 0,
+            blocked_count: 16,
+            complete: false,
+          },
+          destinations: [
+            {
+              group_id: "207110076321670",
+              canonical_name: "二手家電冷氣買賣",
+              attempted: false,
+              final_state: "blocked",
+              evidence: "Not attempted because the source listing id was not canonical.",
+            },
+          ],
+        },
+        externalEffects: [],
+      }),
+      request(),
+    );
+
+    expect(result.ok).toBe(true);
+  });
 });
 
 describe("sanitizeLoopContractForPrompt", () => {
