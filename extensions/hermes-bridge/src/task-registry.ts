@@ -778,7 +778,7 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
     loopContract: sanitizedContract,
     ...(modelRoute
       ? {
-          provider: "codex",
+          provider: "openai",
           model: modelRoute.requested_model,
           thinking: modelRoute.reasoning_effort,
         }

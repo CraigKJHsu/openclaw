@@ -448,7 +448,7 @@ describe("executeHermesBridgeTask", () => {
           externalEffectBudget: 0,
           toolsAllowed: ["read", "write", "web_search", "image_generate"],
           terminal: false,
-          requestedProvider: "codex",
+          requestedProvider: "openai",
           requestedModel: "gpt-5.3-codex-spark",
           requestedThinking: "low",
         },
@@ -457,7 +457,7 @@ describe("executeHermesBridgeTask", () => {
     expect(subagent.run).toHaveBeenCalledWith(
       expect.objectContaining({
         sessionKey: expect.stringContaining("agent:missioncrew-content:subagent:hermes-loop-"),
-        provider: "codex",
+        provider: "openai",
         model: "gpt-5.3-codex-spark",
         thinking: "low",
         toolsAllow: ["read", "write", "web_search", "image_generate"],
@@ -793,9 +793,6 @@ describe("executeHermesBridgeTask", () => {
           runtimeBlocker: "invalid_terminal_result",
           backendRunStatus: "error",
           backendError: "Codex runtime ended before producing a Loop Contract result.",
-          requestedProvider: "codex",
-          requestedModel: "gpt-5.6-terra",
-          requestedThinking: "medium",
         },
         result: {
           status: "blocked",
