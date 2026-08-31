@@ -995,7 +995,11 @@ function hasZeroEffectBlockerText(value: unknown): boolean {
     text.includes("readonly chooser scan") ||
     text.includes("blocked") ||
     text.includes("incomplete") ||
+    text.includes("no numeric group id") ||
     text.includes("no eligible allowlist") ||
+    text.includes("no eligible exact allowlist") ||
+    text.includes("no checkbox was selected") ||
+    text.includes("post remained disabled") ||
     text.includes("stopped before") ||
     text.includes("no external write") ||
     text.includes("no facebook submit") ||

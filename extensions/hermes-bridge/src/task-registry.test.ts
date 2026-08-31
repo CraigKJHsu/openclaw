@@ -145,7 +145,7 @@ describe("auditLoopContractResult", () => {
       JSON.stringify({
         status: "succeeded",
         summary:
-          "Zero-effect readonly chooser scan completed. No eligible allowlist entries were produced because exact numeric group IDs were not available, so the report is incomplete rather than guessed.",
+          "Completed the bounded read-only live chooser scan. The listing-bound List in more places chooser was opened and 47 visible checkbox rows were preserved. No numeric group IDs were exposed in the chooser row href/value/data/id/DOM signals, so no eligible exact allowlist candidates were produced. No checkbox was selected and Post remained disabled.",
         acceptanceEvidence: {
           sourceAliasReadback: {
             public_listing_id: "37276725125275496",
