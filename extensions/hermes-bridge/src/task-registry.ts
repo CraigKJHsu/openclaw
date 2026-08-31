@@ -620,6 +620,7 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
   idempotencyKey: string;
   sessionKey: string;
   loopContract: Record<string, unknown>;
+  provider?: string;
   model?: string;
   thinking?: string;
 } {
@@ -776,7 +777,11 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
     sessionKey: `agent:${requestedAgentId}:subagent:hermes-loop-${identityHash}`,
     loopContract: sanitizedContract,
     ...(modelRoute
-      ? { model: modelRoute.requested_model, thinking: modelRoute.reasoning_effort }
+      ? {
+          provider: "codex",
+          model: modelRoute.requested_model,
+          thinking: modelRoute.reasoning_effort,
+        }
       : {}),
   };
 }
@@ -2787,7 +2792,11 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
         run = await subagent.run({
           sessionKey: validated.sessionKey,
           ...(validated.model
-            ? { model: validated.model, thinking: validated.thinking }
+            ? {
+                provider: validated.provider,
+                model: validated.model,
+                thinking: validated.thinking,
+              }
             : {}),
           toolsAllow: request.allowedTools,
           disableTools: request.allowedTools.length === 0,
@@ -2837,6 +2846,7 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
           terminal: false,
           ...(validated.model
             ? {
+                requestedProvider: validated.provider,
                 requestedModel: validated.model,
                 requestedThinking: validated.thinking,
               }
