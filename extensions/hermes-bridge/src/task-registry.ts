@@ -634,7 +634,7 @@ function requireLoopContractAsyncV2(request: HermesBridgeRequest): {
   const requestedAgentId = request.routing.backendAgentId?.trim();
   const modelRoute = request.routing.modelRoute;
   const missionCrewRoutingV1Sha256 =
-    "380b6f68322e310ff3e800c5d022ebd7997de1242be005b6ae69c74a31e53885";
+    "198fcaf14a27a3610547db169d15af2a9ff5fd9856cc356df0d92cbb0cf567c7";
   const allowedModels = new Set([
     "gpt-5.5",
     "gpt-5.6-sol",
