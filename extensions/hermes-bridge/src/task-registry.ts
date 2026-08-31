@@ -534,7 +534,7 @@ function sanitizeRoutingForPrompt(value: unknown): Record<string, unknown> {
   return safe;
 }
 
-function sanitizeLoopContractForPrompt(value: unknown): Record<string, unknown> {
+export function sanitizeLoopContractForPrompt(value: unknown): Record<string, unknown> {
   const contract = asRecord(value);
   if (!contract) {
     return {};
@@ -562,6 +562,10 @@ function sanitizeLoopContractForPrompt(value: unknown): Record<string, unknown> 
   const userFacingDelivery = cloneJsonRecordForPrompt(contract.user_facing_delivery);
   if (userFacingDelivery && Object.keys(userFacingDelivery).length > 0) {
     safe.user_facing_delivery = userFacingDelivery;
+  }
+  const durableEvidenceSnapshot = cloneJsonRecordForPrompt(contract.durable_evidence_snapshot);
+  if (durableEvidenceSnapshot && Object.keys(durableEvidenceSnapshot).length > 0) {
+    safe.durable_evidence_snapshot = durableEvidenceSnapshot;
   }
   safe.goal = copyTypedSection(contract.goal, {
     strings: ["objective"],
