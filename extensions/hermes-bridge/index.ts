@@ -79,6 +79,7 @@ export default definePluginEntry({
         env: process.env,
         resolveIdempotencyStore,
         subagent: api.runtime.subagent,
+        taskRuns: api.runtime.tasks?.runs,
       }),
     });
 

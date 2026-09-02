@@ -18,6 +18,13 @@ import {
 import { normalizeHermesBridgeRequest } from "./schema.js";
 import { sweepHermesBridgeCleanupObligations } from "./task-registry.js";
 
+function taskRuntime(rows: Array<Record<string, unknown>> = []) {
+  return {
+    bindSession: vi.fn().mockReturnValue({ list: () => rows }),
+    fromToolContext: vi.fn(),
+  } satisfies PluginRuntime["tasks"]["runs"];
+}
+
 function request(raw: Record<string, unknown>) {
   const normalized = normalizeHermesBridgeRequest(raw);
   if (!normalized.ok) {
@@ -269,7 +276,7 @@ function imageGenerationLoopRequest() {
         reasoning_effort: "low",
         reasoning_mode: "standard",
         policy_id: "missioncrew-model-routing-v1",
-        policy_sha256: "4f8024f14e0d740e8761de60e0ff3047a42b760d421cc4e676400a979b41f572",
+        policy_sha256: "198fcaf14a27a3610547db169d15af2a9ff5fd9856cc356df0d92cbb0cf567c7",
       },
     },
     policy: {
@@ -370,6 +377,119 @@ function mockSuccessfulBrowser(targetId = "tab-test") {
 }
 
 describe("executeHermesBridgeTask", () => {
+  it.each(["ok", "error", "succeeded", "failed", "timed_out", "cancelled", "lost", "missing_end"])(
+    "handles yielded detached image work: %s",
+    async (scenario) => {
+      const waitStatus = scenario === "error" ? "error" : "ok";
+      const start = imageGenerationLoopRequest();
+      const hash = createHash("sha256")
+        .update(
+          [
+            start.identity.delegationId,
+            start.identity.attemptId,
+            start.identity.contractFingerprint,
+            start.idempotencyKey,
+          ].join("\0"),
+        )
+        .digest("hex")
+        .slice(0, 24);
+      const sessionKey = `agent:missioncrew-content:subagent:hermes-loop-${hash}`;
+      const rows = [
+        {
+          id: "image-1",
+          ownerKey: sessionKey,
+          status: "running",
+          createdAt: Date.now(),
+          endedAt: undefined as number | undefined,
+        },
+      ];
+      const taskRuns = taskRuntime(rows);
+      const subagent = {
+        run: vi.fn(),
+        waitForRun: vi.fn().mockResolvedValue({ status: waitStatus, terminal: true }),
+        getSession: vi.fn(),
+        getSessionMessages: vi.fn().mockResolvedValue({
+          messages: [
+            { role: "toolResult", content: [{ type: "text", text: '{"status":"yielded"}' }] },
+          ],
+        }),
+        deleteSession: vi.fn(),
+      } satisfies PluginRuntime["subagent"];
+      const config = resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_poll"],
+        allowedTools: start.allowedTools,
+      });
+      const poll = request({
+        ...start,
+        taskId: "openclaw.agent.loop_contract_poll",
+        idempotencyKey: "yield-poll",
+        input: {
+          ...start.input,
+          startIdempotencyKey: start.idempotencyKey,
+          backendRunId: "yield-run",
+          backendSessionKey: sessionKey,
+        },
+      });
+      const invoke = () => executeHermesBridgeTask({ config, request: poll, subagent, taskRuns });
+      if (waitStatus === "error") {
+        expect(await invoke()).toMatchObject({ status: "blocked" });
+        expect(subagent.deleteSession).toHaveBeenCalledExactlyOnceWith({ sessionKey });
+        return;
+      }
+      expect(await invoke()).toMatchObject({
+        status: "running",
+        output: { evidence: { terminal: false } },
+      });
+      expect(subagent.deleteSession).not.toHaveBeenCalled();
+      rows[0].status = "succeeded";
+      rows[0].endedAt = Date.now();
+      expect(await invoke()).toMatchObject({ status: "running" });
+      expect(subagent.deleteSession).not.toHaveBeenCalled();
+      if (scenario !== "ok") {
+        rows[0].status = scenario === "missing_end" ? "lost" : scenario;
+        rows[0].createdAt = Date.now() - 300_001;
+        rows[0].endedAt = scenario === "missing_end" ? undefined : Date.now() - 300_001;
+        expect(await invoke()).toMatchObject({ status: "blocked" });
+        expect(subagent.deleteSession).toHaveBeenCalledExactlyOnceWith({ sessionKey });
+        return;
+      }
+      subagent.getSessionMessages.mockResolvedValue({
+        messages: [
+          {
+            role: "assistant",
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  status: "succeeded",
+                  summary: "Images ready",
+                  acceptanceEvidence: { images: ["image-1"] },
+                  externalEffects: [],
+                }),
+              },
+            ],
+          },
+        ],
+      });
+      // Even a premature final reply cannot discard active detached work.
+      rows[0].status = "running";
+      expect(await invoke()).toMatchObject({ status: "running" });
+      rows[0].status = "succeeded";
+      rows.push({
+        id: "other-image",
+        ownerKey: "another-session",
+        status: "running",
+        createdAt: Date.now(),
+        endedAt: undefined,
+      });
+      expect(await invoke()).toMatchObject({ status: "succeeded" });
+      expect(taskRuns.bindSession).toHaveBeenCalledWith({ sessionKey });
+      expect(subagent.deleteSession).toHaveBeenCalledExactlyOnceWith({ sessionKey });
+    },
+  );
   beforeEach(() => {
     dispatchGatewayMethod.mockReset();
   });
@@ -626,6 +746,7 @@ describe("executeHermesBridgeTask", () => {
       }),
       request: pollRequest,
       subagent,
+      taskRuns: taskRuntime(),
     });
 
     expect(result, JSON.stringify(result)).toMatchObject({
@@ -699,6 +820,7 @@ describe("executeHermesBridgeTask", () => {
       }),
       request: pollRequest,
       subagent,
+      taskRuns: taskRuntime(),
     });
 
     expect(result, JSON.stringify(result)).toMatchObject({
@@ -778,6 +900,7 @@ describe("executeHermesBridgeTask", () => {
       }),
       request: pollRequest,
       subagent,
+      taskRuns: taskRuntime(),
     });
 
     expect(result, JSON.stringify(result)).toMatchObject({
@@ -879,6 +1002,7 @@ describe("executeHermesBridgeTask", () => {
       }),
       request: pollRequest,
       subagent,
+      taskRuns: taskRuntime(),
     });
 
     expect(result, JSON.stringify(result)).toMatchObject({
@@ -2932,6 +3056,7 @@ describe("executeHermesBridgeTask", () => {
       config: readonlyConfig(["openclaw.browser.read_snapshot_poll"]),
       request: pollRequest,
       subagent,
+      taskRuns: taskRuntime(),
       cleanupStore,
     });
 

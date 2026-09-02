@@ -17,6 +17,7 @@ type HandlerParams = {
   idempotencyStore?: HermesBridgeIdempotencyStore;
   resolveIdempotencyStore?: () => HermesBridgeIdempotencyStore;
   subagent?: PluginRuntime["subagent"];
+  taskRuns?: PluginRuntime["tasks"]["runs"];
   executeTask?: typeof executeHermesBridgeTask;
 };
 
@@ -304,6 +305,7 @@ export function createHermesBridgeHttpHandler(params: HandlerParams) {
           config,
           request,
           subagent: params.subagent,
+          taskRuns: params.taskRuns,
           recoveredLease,
           cleanupStore: idempotencyStore,
         });

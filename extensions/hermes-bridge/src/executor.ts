@@ -13,6 +13,7 @@ type ExecuteParams = {
   config: HermesBridgeConfig;
   request: HermesBridgeRequest;
   subagent?: PluginRuntime["subagent"];
+  taskRuns?: PluginRuntime["tasks"]["runs"];
   recoveredLease?: boolean;
   cleanupStore?: HermesBridgeIdempotencyStore;
 };
@@ -84,6 +85,7 @@ export async function executeHermesBridgeTask({
   config,
   request,
   subagent,
+  taskRuns,
   recoveredLease = false,
   cleanupStore,
 }: ExecuteParams): Promise<HermesBridgeResult> {
@@ -187,6 +189,7 @@ export async function executeHermesBridgeTask({
       mode: effectiveMode,
       config,
       subagent: subagent ?? unavailableSubagent,
+      taskRuns,
       recoveredLease,
       cleanupStore,
     });

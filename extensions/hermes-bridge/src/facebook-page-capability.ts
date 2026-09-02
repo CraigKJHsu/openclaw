@@ -238,7 +238,7 @@ export function createFacebookPageCapabilityTools(
         name: "facebook_page_publish_preflight",
         label: "Facebook Page Publish Preflight",
         description:
-          "Deterministically verify the contract-embedded Page source, authorized section removals, final text hash, local PNG dimensions/hash, and Graph Page identity without publishing.",
+          "Verify Page text, PNG and Graph identity without publishing. For a contract-bound accepted package, pass final_message='' and image_path='' to retrieve exact reviewed content through this capability; no general file read is needed. Otherwise verify the contract-embedded source and authorized section removals.",
         parameters: Type.Object({
           final_message: Type.String(),
           image_path: Type.String(),

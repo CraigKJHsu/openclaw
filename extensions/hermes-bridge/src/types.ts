@@ -10,6 +10,7 @@ export type HermesBridgeTaskContext = {
   mode: HermesBridgeMode;
   config: HermesBridgeConfig;
   subagent: PluginRuntime["subagent"];
+  taskRuns?: PluginRuntime["tasks"]["runs"];
   recoveredLease: boolean;
   cleanupStore?: HermesBridgeIdempotencyStore;
 };
