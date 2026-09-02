@@ -853,7 +853,15 @@ describe("executeHermesBridgeTask", () => {
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
   });
 
-  it("returns a structured blocker when a terminal Loop Contract has no result text", async () => {
+  it.each([false, true])("preserves rejected terminal evidence: %s", async (hasRejectedResult) => {
+    const rejected = {
+      status: "succeeded", summary: "Post already created", acceptanceEvidence: { post_id: "123" },
+      externalEffects: [{ target: { page_url: "https://www.facebook.com/solobizai" }, state: "verified" }],
+      domainMemoryDeltas: [{ operation: "upsert", entity_id: "case" }],
+    };
+    const auditError = hasRejectedResult
+      ? "Loop Contract result exceeded its external effect budget."
+      : "Loop Contract result is empty or missing.";
     const startRequest = readonlyMarketplaceLoopRequest();
     const identityHash = createHash("sha256")
       .update(
@@ -874,7 +882,8 @@ describe("executeHermesBridgeTask", () => {
         terminal: true,
         error: "Codex runtime ended before producing a Loop Contract result.",
       }),
-      getSessionMessages: vi.fn().mockResolvedValue({ messages: [] }),
+      getSessionMessages: vi.fn().mockResolvedValue({ messages: hasRejectedResult
+        ? [{ role: "assistant", content: [{ type: "text", text: JSON.stringify(rejected) }] }] : [] }),
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
     } satisfies PluginRuntime["subagent"];
@@ -910,9 +919,9 @@ describe("executeHermesBridgeTask", () => {
         bridgeStatus: "blocked",
         evidence: {
           terminal: true,
-          transcriptMessageCount: 0,
+          transcriptMessageCount: hasRejectedResult ? 1 : 0,
           resultContractValid: true,
-          resultContractError: "Loop Contract result is empty or missing.",
+          resultContractError: auditError,
           runtimeBlocker: "invalid_terminal_result",
           backendRunStatus: "error",
           backendError: "Codex runtime ended before producing a Loop Contract result.",
@@ -922,7 +931,7 @@ describe("executeHermesBridgeTask", () => {
           blocker: {
             kind: "runtime_blocked",
             reason: "invalid_terminal_result",
-            message: "Loop Contract result is empty or missing.",
+            message: auditError,
             backendError: "Codex runtime ended before producing a Loop Contract result.",
           },
           externalEffects: [],
@@ -934,10 +943,12 @@ describe("executeHermesBridgeTask", () => {
         status: "blocked",
         blocker: {
           reason: "invalid_terminal_result",
-          message: "Loop Contract result is empty or missing.",
+          message: auditError,
         },
       },
     );
+    const blocked = (result.output as Record<string, unknown>).result as Record<string, unknown>;
+    expect(blocked.unvalidatedWorkerResult).toEqual(hasRejectedResult ? rejected : undefined);
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
   });
 

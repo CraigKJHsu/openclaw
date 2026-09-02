@@ -212,4 +212,15 @@ describe("sanitizeLoopContractForPrompt", () => {
       ],
     });
   });
+
+  it("preserves the compiler-owned terminal result contract", () => {
+    const terminalContract = {
+      domainMemoryDeltas: { operation: "upsert", shape: "entity with artifacts[]" },
+      externalEffects: { target: "exact approved string", effectKey: "create" },
+    };
+    const sanitized = sanitizeLoopContractForPrompt({
+      terminal_result_contract: terminalContract,
+    });
+    expect(sanitized.terminal_result_contract).toEqual(terminalContract);
+  });
 });

@@ -567,6 +567,10 @@ export function sanitizeLoopContractForPrompt(value: unknown): Record<string, un
   if (durableEvidenceSnapshot && Object.keys(durableEvidenceSnapshot).length > 0) {
     safe.durable_evidence_snapshot = durableEvidenceSnapshot;
   }
+  const terminalContract = cloneJsonRecordForPrompt(contract.terminal_result_contract);
+  if (terminalContract) {
+    safe.terminal_result_contract = terminalContract;
+  }
   safe.goal = copyTypedSection(contract.goal, {
     strings: ["objective"],
     stringArrays: ["deliverables", "non_goals"],
@@ -1044,6 +1048,14 @@ function loopContractInvalidTerminalResult(
 ): Record<string, unknown> {
   const excerpt = params.resultText.trim().slice(0, 1_000);
   const backendError = params.backendError?.trim();
+  // Rejection is not evidence that a dispatched write did not happen. Keep
+  // the original JSON as unvalidated evidence, never as an accepted result.
+  let unvalidatedWorkerResult: Record<string, unknown> | undefined;
+  try {
+    unvalidatedWorkerResult = asRecord(JSON.parse(params.resultText)) ?? undefined;
+  } catch {
+    // Malformed text remains available through the diagnostic excerpt.
+  }
   return {
     status: "blocked",
     summary: `OpenClaw Loop Contract reached a terminal state, but its result could not be accepted: ${params.reason}`,
@@ -1059,6 +1071,7 @@ function loopContractInvalidTerminalResult(
       },
     ],
     externalEffects: [],
+    ...(unvalidatedWorkerResult ? { unvalidatedWorkerResult } : {}),
     blocker: {
       kind: "runtime_blocked",
       reason: "invalid_terminal_result",
