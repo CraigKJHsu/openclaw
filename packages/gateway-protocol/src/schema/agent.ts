@@ -29,6 +29,10 @@ export const AgentGeneratedAttachmentSchema = Type.Object(
     filePath: Type.Optional(Type.String()),
     mimeType: Type.Optional(Type.String()),
     name: Type.Optional(Type.String()),
+    width: Type.Optional(Type.Integer({ minimum: 1 })),
+    height: Type.Optional(Type.Integer({ minimum: 1 })),
+    dimensions: Type.Optional(Type.String({ pattern: "^[1-9][0-9]*x[1-9][0-9]*$" })),
+    sha256: Type.Optional(Type.String({ pattern: "^[a-fA-F0-9]{64}$" })),
   },
   { additionalProperties: false },
 );
