@@ -1,6 +1,32 @@
 // Openai tests cover image generation provider plugin behavior.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { buildOpenAIImageGenerationProvider } from "./image-generation-provider.js";
+import {
+  buildOpenAIImageGenerationProvider,
+  sanitizeAiBizWeekPageHeroPrompt,
+} from "./image-generation-provider.js";
+
+describe("sanitizeAiBizWeekPageHeroPrompt", () => {
+  it("removes disclosure instructions only from AI BizWeek Page Hero prompts", () => {
+    const prompt = [
+      "Create an AI BizWeek asset_family: page_hero image.",
+      "Do not include any AI disclosure text.",
+      "Leave room for a deterministic disclosure overlay.",
+      "Keep the bottom-left margin clean.",
+    ].join("\n");
+
+    expect(sanitizeAiBizWeekPageHeroPrompt(prompt)).toBe(
+      [
+        "Create an AI BizWeek asset_family: page_hero image.",
+        "Keep the bottom-left margin clean.",
+      ].join("\n"),
+    );
+  });
+
+  it("does not alter unrelated image prompts", () => {
+    const prompt = "Create a product image with a disclosure label.";
+    expect(sanitizeAiBizWeekPageHeroPrompt(prompt)).toBe(prompt);
+  });
+});
 
 const {
   ensureAuthProfileStoreMock,

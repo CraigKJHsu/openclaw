@@ -18,14 +18,18 @@ async function executeTool(rawParams: Record<string, unknown>) {
 describe("hermes_bridge tool", () => {
   it("lists mock-safe task templates", async () => {
     await expect(executeTool({ action: "list_tasks" })).resolves.toMatchObject({
-      tasks: [
-        { taskId: "status.echo" },
-        { taskId: "status.health" },
-        { taskId: "message.preview" },
-        { taskId: "tasks.organize_today" },
-        { taskId: "agents.ask_team" },
-        { taskId: "message.send", dangerous: true },
-      ],
+      tasks: expect.arrayContaining([
+        expect.objectContaining({ taskId: "status.echo" }),
+        expect.objectContaining({
+          taskId: "openclaw.browser.read_snapshot",
+          mockOnly: false,
+        }),
+        expect.objectContaining({ taskId: "status.health" }),
+        expect.objectContaining({ taskId: "message.preview" }),
+        expect.objectContaining({ taskId: "tasks.organize_today" }),
+        expect.objectContaining({ taskId: "agents.ask_team" }),
+        expect.objectContaining({ taskId: "message.send", dangerous: true }),
+      ]),
     });
   });
 

@@ -1,5 +1,6 @@
 // Background media generation tests cover detached task completion, requester
 // wake delivery, and direct media fallback behavior.
+import { validateAgentParams } from "@openclaw/gateway-protocol";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SessionEntry } from "../../config/sessions/types.js";
 
@@ -534,7 +535,7 @@ describe("createMediaGenerationTaskLifecycle", () => {
     });
   });
 
-  it("returns the completion wake delivery result", async () => {
+  it("delivers generated image metadata through the agent RPC schema", async () => {
     subagentAnnounceDeliveryMocks.deliverSubagentAnnouncement.mockResolvedValueOnce({
       delivered: true,
     });
@@ -555,8 +556,23 @@ describe("createMediaGenerationTaskLifecycle", () => {
         status: "ok",
         statusLabel: "completed successfully",
         result: "generated",
+        attachments: [{
+          type: "image",
+          path: "/tmp/openclaw/hero.png",
+          width: 1536,
+          height: 864,
+          dimensions: "1536x864",
+          sha256: "a".repeat(64),
+        }],
       }),
     ).resolves.toBe(true);
+    const delivered = subagentAnnounceDeliveryMocks.deliverSubagentAnnouncement.mock.calls[0][0];
+    expect(validateAgentParams({
+      message: delivered.triggerMessage,
+      sessionKey: delivered.requesterSessionKey,
+      idempotencyKey: delivered.announceId,
+      internalEvents: delivered.internalEvents,
+    })).toBe(true);
   });
 
   it("treats terminal generated-media fallback failure as handled", async () => {

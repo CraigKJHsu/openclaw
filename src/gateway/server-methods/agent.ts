@@ -1096,6 +1096,8 @@ export const agentHandlers: GatewayRequestHandlers = {
       inputProvenance?: InputProvenance;
       workspaceDir?: string;
       voiceWakeTrigger?: string;
+      toolsAllow?: string[];
+      disableTools?: boolean;
     };
     const allowModelOverride = resolveAllowModelOverrideFromClient(client);
     const canUseInternalRuntimeHandoff = resolveCanUseInternalRuntimeHandoff(client);
@@ -2789,6 +2791,8 @@ export const agentHandlers: GatewayRequestHandlers = {
               preserveUserFacingSessionModelState,
               sourceReplyDeliveryMode: request.sourceReplyDeliveryMode,
               disableMessageTool: request.disableMessageTool,
+              toolsAllow: request.toolsAllow,
+              disableTools: request.disableTools,
               suppressPromptPersistence:
                 requestedPromptPersistenceSuppression ||
                 shouldSuppressAgentPromptPersistence({

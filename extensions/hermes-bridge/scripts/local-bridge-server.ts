@@ -14,6 +14,18 @@ export const HERMES_BRIDGE_LOCAL_ALLOWED_TASKS = [
   "message.preview",
   "tasks.organize_today",
   "agents.ask_team",
+  "openclaw.agent.loop_contract_start",
+  "openclaw.agent.loop_contract_poll",
+  "openclaw.agent.loop_contract_cancel",
+] as const;
+
+export const HERMES_BRIDGE_LOCAL_ALLOWED_TOOLS = [
+  "read",
+  "write",
+  "web_search",
+  "image_generate",
+  "browser",
+  "browser.read",
 ] as const;
 
 type StartupParams = {
@@ -62,12 +74,12 @@ const host = process.env.OPENCLAW_HERMES_BRIDGE_HOST ?? DEFAULT_HOST;
 
 const config = resolveHermesBridgeConfig({
   enabled: true,
-  mode: "mock",
+  mode: "live",
   hermesMode: "real",
   sharedSecretEnv: "OPENCLAW_HERMES_BRIDGE_TOKEN",
   allowedTasks: [...HERMES_BRIDGE_LOCAL_ALLOWED_TASKS],
-  allowedTools: [],
-  maxRequestBytes: 65_536,
+  allowedTools: [...HERMES_BRIDGE_LOCAL_ALLOWED_TOOLS],
+  maxRequestBytes: 1_048_576,
 });
 
 const bridgeHandler = createHermesBridgeHttpHandler({
@@ -128,7 +140,9 @@ function printStartupDiagnostics(): void {
     console.warn("OPENCLAW_GATEWAY_TOKEN is not configured; task route requests will be rejected.");
   }
   if (!diagnostics.bridgeTokenConfigured) {
-    console.warn("OPENCLAW_HERMES_BRIDGE_TOKEN is not configured; task route requests will fail closed.");
+    console.warn(
+      "OPENCLAW_HERMES_BRIDGE_TOKEN is not configured; task route requests will fail closed.",
+    );
   }
 }
 

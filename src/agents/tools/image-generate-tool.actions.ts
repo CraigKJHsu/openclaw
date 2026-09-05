@@ -14,6 +14,7 @@ import {
   buildImageGenerationTaskStatusText,
   findActiveImageGenerationTaskForSession,
   findDuplicateGuardImageGenerationTaskForSession,
+  findRecentSuccessfulImageGenerationTaskForSession,
   listActiveImageGenerationTasksForSession,
 } from "../image-generation-task-status.js";
 import {
@@ -111,6 +112,28 @@ export function createImageGenerateStatusActionResult(
       details: {
         action: "status",
         ...buildImageGenerationTaskStatusListDetails(activeTasks),
+      },
+    };
+  }
+  if (activeTasks.length === 1) {
+    return imageGenerateTaskStatusActions.createStatusActionResult(sessionKey);
+  }
+  const recentSuccessfulTask = findRecentSuccessfulImageGenerationTaskForSession(sessionKey);
+  if (recentSuccessfulTask) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: [
+            buildImageGenerationTaskStatusText(recentSuccessfulTask),
+            "The image task is no longer active. Use the completed output above; only start a new generation if the completed image does not satisfy the request.",
+          ].join("\n"),
+        },
+      ],
+      details: {
+        action: "status",
+        recentCompleted: true,
+        ...buildImageGenerationTaskStatusDetails(recentSuccessfulTask),
       },
     };
   }
