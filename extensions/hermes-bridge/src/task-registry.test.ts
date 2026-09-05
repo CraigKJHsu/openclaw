@@ -60,6 +60,264 @@ describe("auditLoopContractResult", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("normalizes an empty undeclared domain-memory delta list", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        externalEffects: [],
+        domainMemoryDeltas: [],
+      }),
+      zeroEffectRequest,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.parsed).not.toHaveProperty("domainMemoryDeltas");
+  });
+
+  it("repairs a detached domain-memory delta field from an otherwise valid result", () => {
+    const domainRequest = request();
+    domainRequest.policy.externalEffectBudget = 0;
+    domainRequest.policy.credentialRefs = [];
+    domainRequest.allowedTools = [];
+    domainRequest.input.loopContract = {
+      external_targets: [],
+      domain_memory: {
+        schema_id: "secondhand.item.v1",
+        domain_key: "secondhand",
+        entity_type: "ResaleItem",
+        mode: "query",
+      },
+    };
+    const result = auditLoopContractResult(
+      '{"status":"blocked","summary":"browser unavailable","externalEffects":[],"acceptanceEvidence":{"blocker":{"owner":"openclaw_worker","scope":"contracted_deliverable","kind":"facebook_readonly_verification_unavailable","reason":"snapshot timed out"}}},"domainMemoryDeltas":[]}',
+      domainRequest,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.parsed?.domainMemoryDeltas).toEqual([]);
+  });
+
+  it("does not repair arbitrary trailing JSON data", () => {
+    const domainRequest = request();
+    domainRequest.input.loopContract = {
+      ...(domainRequest.input.loopContract as Record<string, unknown>),
+      domain_memory: {
+        schema_id: "secondhand.item.v1",
+        domain_key: "secondhand",
+        entity_type: "ResaleItem",
+        mode: "query",
+      },
+    };
+    const result = auditLoopContractResult(
+      '{"status":"succeeded","externalEffects":[]},"unexpected":[]}',
+      domainRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Loop Contract result is not valid JSON.",
+    });
+  });
+
+  it("rejects non-empty undeclared domain-memory deltas", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        externalEffects: [],
+        domainMemoryDeltas: [{ operation: "upsert" }],
+      }),
+      zeroEffectRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Loop Contract result returned domainMemoryDeltas without a domain_memory contract.",
+    });
+  });
+
+  it("rejects noncanonical domain-memory modes", () => {
+    const domainRequest = request();
+    domainRequest.input.loopContract = {
+      ...(domainRequest.input.loopContract as Record<string, unknown>),
+      domain_memory: {
+        schema_id: "solobizai.case.v1",
+        domain_key: "solobizai",
+        entity_type: "SoloBizAiCase",
+        mode: "MUTATE",
+      },
+    };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        externalEffects: [],
+        domainMemoryDeltas: [{ operation: "upsert" }],
+      }),
+      domainRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Domain-memory mode must be query or mutate.",
+    });
+  });
+
+  it("requires deltas for a domain-memory mutation", () => {
+    const domainRequest = request();
+    domainRequest.input.loopContract = {
+      ...(domainRequest.input.loopContract as Record<string, unknown>),
+      domain_memory: {
+        schema_id: "solobizai.case.v1",
+        domain_key: "solobizai",
+        entity_type: "SoloBizAiCase",
+        mode: "mutate",
+      },
+    };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        externalEffects: [
+          {
+            target: "https://www.facebook.com/solobizai",
+            effectKey: "facebook_page_photo_post:test",
+            state: "verified",
+            externalId: "post_test",
+            readback: { post_id: "post_test" },
+          },
+        ],
+        domainMemoryDeltas: [],
+      }),
+      domainRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Domain-memory mutation returned no domainMemoryDeltas.",
+    });
+  });
+
+  it("does not let blocker-shaped evidence waive successful mutation deltas", () => {
+    const domainRequest = request();
+    domainRequest.input.loopContract = {
+      ...(domainRequest.input.loopContract as Record<string, unknown>),
+      domain_memory: {
+        schema_id: "solobizai.case.v1",
+        domain_key: "solobizai",
+        entity_type: "SoloBizAiCase",
+        mode: "mutate",
+      },
+    };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        acceptanceEvidence: {
+          blocker: {
+            owner: "openclaw_worker",
+            scope: "contracted_deliverable",
+            kind: "required_source_unavailable",
+            reason: "source unavailable",
+          },
+        },
+        externalEffects: [],
+        domainMemoryDeltas: [],
+      }),
+      domainRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Domain-memory mutation returned no domainMemoryDeltas.",
+    });
+  });
+
+  it("rejects registry mutations from a blocked result", () => {
+    const domainRequest = request();
+    domainRequest.policy.externalEffectBudget = 0;
+    domainRequest.policy.credentialRefs = [];
+    domainRequest.allowedTools = [];
+    domainRequest.input.loopContract = {
+      external_targets: [],
+      domain_memory: {
+        schema_id: "solobizai.case.v1",
+        domain_key: "solobizai",
+        entity_type: "SoloBizAiCase",
+        mode: "mutate",
+      },
+    };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "blocked",
+        acceptanceEvidence: {
+          blocker: {
+            owner: "openclaw_worker",
+            scope: "contracted_deliverable",
+            kind: "required_source_unavailable",
+            reason: "source unavailable",
+          },
+        },
+        externalEffects: [],
+        domainMemoryDeltas: [{ operation: "upsert" }],
+      }),
+      domainRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "Blocked domain-memory result must not return registry mutations.",
+    });
+  });
+
+  it("fails closed on domain-memory mutation until canonical effect binding exists", () => {
+    const domainRequest = request();
+    domainRequest.input.loopContract = {
+      ...(domainRequest.input.loopContract as Record<string, unknown>),
+      domain_memory: {
+        schema_id: "solobizai.case.v1",
+        domain_key: "solobizai",
+        entity_type: "SoloBizAiCase",
+        mode: "mutate",
+      },
+    };
+    const delta = {
+      operation: "upsert",
+      entity_id: "case-test",
+      label: "Test case",
+      status: "active",
+      artifacts: [],
+      evidence_refs: ["task_external_effect:facebook:facebook_page_photo_post:test"],
+    };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        externalEffects: [
+          {
+            target: "https://www.facebook.com/solobizai",
+            effectKey: "facebook_page_photo_post:test",
+            state: "verified",
+            externalId: "post_test",
+            readback: { post_id: "post_test" },
+          },
+        ],
+        domainMemoryDeltas: [delta],
+      }),
+      domainRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason: "OpenClaw domain-memory mutation requires canonical effect binding.",
+    });
+  });
+
   it("rejects empty structured readback evidence", () => {
     const result = auditLoopContractResult(
       JSON.stringify({
@@ -79,7 +337,8 @@ describe("auditLoopContractResult", () => {
 
     expect(result).toEqual({
       ok: false,
-      reason: "Loop Contract external effect evidence is incomplete or outside the approved targets.",
+      reason:
+        "Loop Contract external effect evidence is incomplete or outside the approved targets.",
     });
   });
 
@@ -90,8 +349,7 @@ describe("auditLoopContractResult", () => {
         summary:
           "blocked: the live management dialog resolved to a forbidden listing id, so no external write was performed.",
         acceptanceEvidence: {
-          blocker:
-            "The listing-bound management dialog resolved to a forbidden listing id.",
+          blocker: "The listing-bound management dialog resolved to a forbidden listing id.",
           coverage: {
             expected_total: 16,
             named_count: 16,
@@ -140,6 +398,141 @@ describe("auditLoopContractResult", () => {
     expect(result.ok).toBe(true);
   });
 
+  it("accepts a structured blocked result for a zero-budget worker-scope blocker", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "blocked",
+        summary: "blocked: the required source document is unavailable to the worker.",
+        acceptanceEvidence: {
+          blocker: {
+            owner: "openclaw_worker",
+            scope: "contracted_deliverable",
+            kind: "required_source_unavailable",
+            reason: "required_source_unavailable",
+          },
+        },
+        externalEffects: [],
+      }),
+      zeroEffectRequest,
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.parsed?.status).toBe("blocked");
+  });
+
+  it("reports an explicit blocked result without evidence precisely", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+
+    const result = auditLoopContractResult(
+      JSON.stringify({ status: "blocked", externalEffects: [] }),
+      zeroEffectRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "Loop Contract result declared status=blocked without structured zero-effect blocker evidence.",
+    });
+  });
+
+  it("rejects controller-tool availability as a worker-scope blocker", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "blocked",
+        summary: "blocked: kanban_complete is unavailable in this worker runtime.",
+        acceptanceEvidence: {
+          blocker: {
+            kind: "capability",
+            reason: "kanban_complete_unavailable",
+          },
+        },
+        externalEffects: [],
+      }),
+      zeroEffectRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "Loop Contract result declared status=blocked without structured zero-effect blocker evidence.",
+    });
+  });
+
+  it("rejects paraphrased controller blockers without canonical worker ownership", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "blocked",
+        summary: "The Kanban completion tool is unavailable.",
+        acceptanceEvidence: {
+          blocker: {
+            kind: "capability",
+            reason: "completion_tool_unavailable",
+          },
+        },
+        externalEffects: [],
+      }),
+      zeroEffectRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "Loop Contract result declared status=blocked without structured zero-effect blocker evidence.",
+    });
+  });
+
+  it("rejects worker self-labels without a controller-owned blocker kind", () => {
+    const zeroEffectRequest = request();
+    zeroEffectRequest.policy.externalEffectBudget = 0;
+    zeroEffectRequest.policy.credentialRefs = [];
+    zeroEffectRequest.allowedTools = [];
+    zeroEffectRequest.input.loopContract = { external_targets: [] };
+
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "blocked",
+        acceptanceEvidence: {
+          blocker: {
+            owner: "openclaw_worker",
+            scope: "contracted_deliverable",
+            kind: "capability",
+            reason: "completion service unavailable",
+          },
+        },
+        externalEffects: [],
+      }),
+      zeroEffectRequest,
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      reason:
+        "Loop Contract result declared status=blocked without structured zero-effect blocker evidence.",
+    });
+  });
+
   it("accepts credentialed readonly chooser scans with no external effects", () => {
     const result = auditLoopContractResult(
       JSON.stringify({
@@ -155,8 +548,7 @@ describe("auditLoopContractResult", () => {
           eligibleCandidates: [],
           rejectedOptions: [
             {
-              canonical_name:
-                "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
+              canonical_name: "(北市新北) 冷氣 家電 家具 五金 雜貨全新中古買賣",
               reason: "visible in chooser but no exact numeric group ID exposed",
             },
           ],
@@ -213,14 +605,31 @@ describe("sanitizeLoopContractForPrompt", () => {
     });
   });
 
-  it("preserves the compiler-owned terminal result contract", () => {
+  it("preserves compiler-owned domain-memory contracts", () => {
     const terminalContract = {
       domainMemoryDeltas: { operation: "upsert", shape: "entity with artifacts[]" },
       externalEffects: { target: "exact approved string", effectKey: "create" },
     };
     const sanitized = sanitizeLoopContractForPrompt({
       terminal_result_contract: terminalContract,
+      domain_memory: {
+        schema_id: "solobizai.case.v1",
+        domain_key: "solobizai",
+        entity_type: "SoloBizAiCase",
+        mode: "mutate",
+        require_delta_on_acceptance: true,
+        artifact_types: ["facebook_page_post", "podcast_episode", "audio_brief"],
+      },
     });
     expect(sanitized.terminal_result_contract).toEqual(terminalContract);
+
+    expect(sanitized.domain_memory).toEqual({
+      schema_id: "solobizai.case.v1",
+      domain_key: "solobizai",
+      entity_type: "SoloBizAiCase",
+      mode: "mutate",
+      require_delta_on_acceptance: true,
+      artifact_types: ["facebook_page_post", "podcast_episode", "audio_brief"],
+    });
   });
 });

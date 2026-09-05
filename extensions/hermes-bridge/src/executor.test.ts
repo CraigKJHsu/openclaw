@@ -532,6 +532,8 @@ describe("executeHermesBridgeTask", () => {
     );
     const prompt = subagent.run.mock.calls[0]?.[0]?.message ?? "";
     expect(prompt).toContain("External Browser Publish");
+    expect(prompt).toContain("credential_unavailable");
+    expect(prompt).toContain("verification_unavailable");
     expect(prompt).not.toContain("drop.example/string-checklist");
   });
 
@@ -588,7 +590,45 @@ describe("executeHermesBridgeTask", () => {
     expect(prompt).toContain("Carter Page body source text.");
     expect(prompt).toContain("Complete Carter Page Hero policy content: exact 4:5.");
     expect(prompt).toContain("Complete Audio Brief policy content: fixed eight-zone 1:1.");
+    expect(prompt).toContain('blocker kind="image_generation_failed"');
   });
+
+  it.each(["mutate", " mutate ", "MUTATE", "unknown"])(
+    "rejects unsupported domain-memory mode %s before worker dispatch",
+    async (mode) => {
+      const mutationRequest = readonlyMarketplaceLoopRequest();
+      const loopContract = mutationRequest.input.loopContract as Record<string, unknown>;
+      loopContract.domain_memory = {
+        schema_id: "secondhand.item.v1",
+        domain_key: "secondhand",
+        entity_type: "ResaleItem",
+        mode,
+        require_delta_on_acceptance: true,
+      };
+      const subagent = {
+        run: vi.fn(),
+        waitForRun: vi.fn(),
+        getSessionMessages: vi.fn(),
+        getSession: vi.fn(),
+        deleteSession: vi.fn(),
+      } satisfies PluginRuntime["subagent"];
+
+      const result = await executeHermesBridgeTask({
+        config: resolveHermesBridgeConfig({
+          enabled: true,
+          mode: "live",
+          hermesMode: "real",
+          allowedTasks: ["openclaw.agent.loop_contract_start"],
+          allowedTools: ["read", "web_search", "browser"],
+        }),
+        request: mutationRequest,
+        subagent,
+      });
+
+      expect(result).toMatchObject({ ok: false, status: "failed" });
+      expect(subagent.run).not.toHaveBeenCalled();
+    },
+  );
 
   it("rejects reasoning efforts unsupported by the selected model", async () => {
     const request = imageGenerationLoopRequest();
@@ -855,8 +895,12 @@ describe("executeHermesBridgeTask", () => {
 
   it.each([false, true])("preserves rejected terminal evidence: %s", async (hasRejectedResult) => {
     const rejected = {
-      status: "succeeded", summary: "Post already created", acceptanceEvidence: { post_id: "123" },
-      externalEffects: [{ target: { page_url: "https://www.facebook.com/solobizai" }, state: "verified" }],
+      status: "succeeded",
+      summary: "Post already created",
+      acceptanceEvidence: { post_id: "123" },
+      externalEffects: [
+        { target: { page_url: "https://www.facebook.com/solobizai" }, state: "verified" },
+      ],
       domainMemoryDeltas: [{ operation: "upsert", entity_id: "case" }],
     };
     const auditError = hasRejectedResult
@@ -882,8 +926,11 @@ describe("executeHermesBridgeTask", () => {
         terminal: true,
         error: "Codex runtime ended before producing a Loop Contract result.",
       }),
-      getSessionMessages: vi.fn().mockResolvedValue({ messages: hasRejectedResult
-        ? [{ role: "assistant", content: [{ type: "text", text: JSON.stringify(rejected) }] }] : [] }),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: hasRejectedResult
+          ? [{ role: "assistant", content: [{ type: "text", text: JSON.stringify(rejected) }] }]
+          : [],
+      }),
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
     } satisfies PluginRuntime["subagent"];
@@ -950,6 +997,89 @@ describe("executeHermesBridgeTask", () => {
     const blocked = (result.output as Record<string, unknown>).result as Record<string, unknown>;
     expect(blocked.unvalidatedWorkerResult).toEqual(hasRejectedResult ? rejected : undefined);
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
+  });
+
+  it("does not verify a worker blocker when the backend run failed", async () => {
+    const startRequest = readonlyMarketplaceLoopRequest();
+    const identityHash = createHash("sha256")
+      .update(
+        [
+          startRequest.identity.delegationId,
+          startRequest.identity.attemptId,
+          startRequest.identity.contractFingerprint,
+          startRequest.idempotencyKey,
+        ].join("\0"),
+      )
+      .digest("hex")
+      .slice(0, 24);
+    const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${identityHash}`;
+    const workerBlocker = {
+      status: "blocked",
+      summary: "blocked: the required source is unavailable.",
+      acceptanceEvidence: {
+        blocker: {
+          owner: "openclaw_worker",
+          scope: "contracted_deliverable",
+          kind: "required_source_unavailable",
+          reason: "required_source_unavailable",
+        },
+      },
+      externalEffects: [],
+    };
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn().mockResolvedValue({
+        status: "error",
+        terminal: true,
+        error: "Backend run failed before a verified terminal result.",
+      }),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: [{ role: "assistant", content: JSON.stringify(workerBlocker) }],
+      }),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+    const pollRequest = request({
+      ...startRequest,
+      taskId: "openclaw.agent.loop_contract_poll",
+      idempotencyKey: "marketplace-readonly-start:poll:failed-worker-blocker",
+      input: {
+        ...startRequest.input,
+        startIdempotencyKey: "marketplace-readonly-start",
+        backendRunId: "marketplace-readonly-run",
+        backendSessionKey: sessionKey,
+      },
+    });
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_poll"],
+        allowedTools: ["read", "web_search", "browser"],
+      }),
+      request: pollRequest,
+      subagent,
+      taskRuns: taskRuntime(),
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({
+      ok: true,
+      status: "blocked",
+      output: {
+        bridgeStatus: "blocked",
+        evidence: {
+          resultContractValid: true,
+          runtimeBlocker: "invalid_terminal_result",
+          backendRunStatus: "error",
+          backendError: "Backend run failed before a verified terminal result.",
+        },
+        result: {
+          blocker: { reason: "invalid_terminal_result" },
+        },
+      },
+    });
   });
 
   it("accepts local image generation receipts without consuming external effect budget", async () => {
