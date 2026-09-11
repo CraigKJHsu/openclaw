@@ -36,6 +36,188 @@ function request(): HermesBridgeRequest {
 }
 
 describe("auditLoopContractResult", () => {
+  it.each([
+    "valid",
+    "no_approval",
+    "wrong_agent",
+    "wrong_tool",
+    "wrong_type",
+    "wrong_domain",
+    "wrong_budget",
+    "wrong_transport",
+    "wrong_ref",
+    "wrong_post",
+    "wrong_target",
+    "unverified",
+    "wrong_artifact",
+    "informational_only",
+    "empty_artifacts",
+    "unbound_extra",
+    "empty_deltas",
+    "missing_readback",
+    "readback_failed",
+    "readback_unpublished",
+    "readback_unverified",
+    "readback_wrong_post",
+    "missing_permalink",
+    "foreign_permalink",
+    "wrong_artifact_url",
+  ])("binds approved Page publication deltas to the canonical create effect: %s", (fault) => {
+    const scoped = request();
+    scoped.identity.taskType =
+      fault === "wrong_type" ? "facebook_page_publish_preflight" : "facebook_page_api_publish";
+    scoped.allowedTools =
+      fault === "wrong_tool"
+        ? ["browser"]
+        : ["facebook_page_graph_status", "facebook_page_graph_publish"];
+    if (fault === "no_approval") delete scoped.policy.approvalGrantId;
+    if (fault === "wrong_agent") scoped.routing.backendAgentId = "missioncrew-browser-operator";
+    if (fault === "wrong_budget") scoped.policy.externalEffectBudget = 2;
+    const pageUrl = "https://www.facebook.com/123";
+    scoped.input.loopContract = {
+      external_targets: [pageUrl],
+      facebook_page_post: {
+        action: "create_post",
+        transport: fault === "wrong_transport" ? "browser" : "graph_api",
+        page_id: "123",
+        page_url: pageUrl,
+      },
+      domain_memory: {
+        mode: "mutate",
+        schema_id: "solobizai.case.v1",
+        domain_key: fault === "wrong_domain" ? "other" : "solobizai",
+        entity_type: "SoloBizAiCase",
+      },
+    };
+    const ref = "task_external_effect:facebook:create";
+    const artifact = {
+      artifact_type: fault === "wrong_artifact" ? "podcast_episode" : "facebook_page_post",
+      status: fault === "informational_only" ? "draft" : "published",
+      platform: "facebook",
+      external_id: fault === "wrong_post" ? "123_789" : "123_456",
+      public_url:
+        fault === "wrong_artifact_url"
+          ? "https://example.com/wrong"
+          : "https://www.facebook.com/123/posts/456",
+      evidence_ref: fault === "wrong_ref" ? "task_external_effect:facebook:other" : ref,
+    };
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        summary: "Published once",
+        acceptanceEvidence: { verified: true },
+        externalEffects: [
+          {
+            target: fault === "wrong_target" ? "https://www.facebook.com/999" : pageUrl,
+            effectKey: "create",
+            externalId: "123_456",
+            state: fault === "unverified" ? "unknown" : "verified",
+            readback:
+              fault === "missing_readback"
+                ? undefined
+                : {
+                    success: fault !== "readback_failed",
+                    published: fault !== "readback_unpublished",
+                    verified: fault !== "readback_unverified",
+                    post_id: fault === "readback_wrong_post" ? "123_789" : "123_456",
+                    permalink_url:
+                      fault === "missing_permalink"
+                        ? undefined
+                        : fault === "foreign_permalink"
+                          ? "https://example.com/wrong"
+                          : "https://www.facebook.com/123/posts/456",
+                  },
+          },
+        ],
+        domainMemoryDeltas:
+          fault === "empty_deltas"
+            ? []
+            : [
+                {
+                  entity_id: "case-a",
+                  label: "Case A",
+                  status: "published",
+                  evidence_refs: [ref],
+                  artifacts:
+                    fault === "empty_artifacts"
+                      ? []
+                      : fault === "unbound_extra"
+                        ? [artifact, { ...artifact, artifact_type: "podcast_episode" }]
+                        : [artifact],
+                },
+              ],
+      }),
+      scoped,
+    );
+    expect(result.ok, result.reason).toBe(fault === "valid");
+  });
+
+  it.each([
+    "valid",
+    "missing_ref",
+    "wrong_group",
+    "no_approval",
+    "empty_artifacts",
+    "informational_only",
+    "wrong_target",
+    "unverified",
+  ])("audits approved secondhand mutation binding: %s", (fault) => {
+    const scoped = request();
+    scoped.routing.backendAgentId = "missioncrew-browser-operator";
+    scoped.allowedTools = ["browser"];
+    scoped.input.loopContract = {
+      external_targets: ["https://www.facebook.com/groups/123"],
+      facebook_group_publish: { mode: "listing_bound_chooser" },
+      domain_memory: {
+        schema_id: "secondhand.item.v1",
+        domain_key: "secondhand",
+        entity_type: "ResaleItem",
+        mode: "mutate",
+      },
+    };
+    if (fault === "no_approval") delete scoped.policy.approvalGrantId;
+    const ref = "task_external_effect:facebook:group:123";
+    const result = auditLoopContractResult(
+      JSON.stringify({
+        status: "succeeded",
+        externalEffects: [
+          {
+            target:
+              fault === "wrong_target"
+                ? "https://www.facebook.com/groups/456"
+                : "https://www.facebook.com/groups/123",
+            effectKey: "group:123",
+            state: fault === "unverified" ? "attempted" : "verified",
+            readback: { published: true },
+          },
+        ],
+        domainMemoryDeltas: [
+          {
+            operation: "upsert",
+            entity_id: "telescope",
+            label: "Celestron",
+            status: "active",
+            evidence_refs: fault === "missing_ref" ? [] : [ref],
+            artifacts:
+              fault === "empty_artifacts"
+                ? []
+                : [
+                    {
+                      artifact_type: "facebook_group_post",
+                      platform: "facebook",
+                      external_id: fault === "wrong_group" ? "456" : "123",
+                      status: fault === "informational_only" ? "planned" : "published",
+                      evidence_ref: ref,
+                    },
+                  ],
+          },
+        ],
+      }),
+      scoped,
+    );
+    expect(result.ok).toBe(fault === "valid");
+  });
+
   it("accepts structured Graph API readback evidence", () => {
     const result = auditLoopContractResult(
       JSON.stringify({
@@ -631,5 +813,31 @@ describe("sanitizeLoopContractForPrompt", () => {
       require_delta_on_acceptance: true,
       artifact_types: ["facebook_page_post", "podcast_episode", "audio_brief"],
     });
+  });
+});
+
+it("preserves the exact publication contract and safe approval receipt for the worker", () => {
+  const publication = {
+    mode: "listing_bound_chooser",
+    source_listing_id: "456",
+    destinations: [{ group_id: "123", canonical_url: "https://www.facebook.com/groups/123" }],
+  };
+  const safe = sanitizeLoopContractForPrompt({
+    facebook_group_publish: publication,
+    objective_ref: { objective_id: "objective", stage_key: "publish" },
+    approval_provenance: {
+      source: "one_time_authenticated_owner_challenge",
+      contract_fingerprint: "fp",
+      scope_binding: "exact_loop_contract_fingerprint",
+      approved_message_id: "9198",
+      user_id: "private-owner",
+    },
+  });
+  expect(safe.facebook_group_publish).toEqual(publication);
+  expect(safe.objective_ref).toEqual({ objective_id: "objective", stage_key: "publish" });
+  expect(safe.approval_provenance).toEqual({
+    source: "one_time_authenticated_owner_challenge",
+    contract_fingerprint: "fp",
+    scope_binding: "exact_loop_contract_fingerprint",
   });
 });

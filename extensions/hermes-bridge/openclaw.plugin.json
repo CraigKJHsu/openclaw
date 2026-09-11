@@ -6,6 +6,7 @@
   "contracts": {
     "tools": [
       "hermes_bridge",
+      "missioncrew_submit_result",
       "facebook_page_publish_preflight",
       "facebook_page_graph_status",
       "facebook_page_graph_publish"

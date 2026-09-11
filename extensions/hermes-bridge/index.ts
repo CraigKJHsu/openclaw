@@ -3,6 +3,7 @@ import { resolveHermesBridgeConfig } from "./src/config.js";
 import { createFacebookPageCapabilityTools } from "./src/facebook-page-capability.js";
 import { createHermesBridgeHttpHandler } from "./src/http-route.js";
 import { SqliteHermesBridgeIdempotencyStore } from "./src/idempotency-store.js";
+import { createResultTool, RESULT_TOOL } from "./src/result-tool.js";
 import { sweepHermesBridgeCleanupObligations } from "./src/task-registry.js";
 import { createHermesBridgeTool } from "./src/tool.js";
 
@@ -61,11 +62,17 @@ export default definePluginEntry({
       cleanup: () => {
         if (cleanupTimer) {
           clearInterval(cleanupTimer);
+          cleanupTimer = undefined;
         }
         if (startupTimer) {
           clearTimeout(startupTimer);
+          startupTimer = undefined;
         }
-        idempotencyStore?.close();
+        // Runtime cleanup can precede reuse of this registered HTTP handler.
+        // Reopen the durable store on demand; never reuse a closed connection.
+        const store = idempotencyStore;
+        idempotencyStore = undefined;
+        store?.close();
       },
     });
 
@@ -101,5 +108,12 @@ export default definePluginEntry({
       ],
       optional: true,
     });
+    api.registerTool(
+      (ctx) =>
+        resolveConfig().enabled && ctx.sessionKey?.includes(":subagent:hermes-loop-")
+          ? createResultTool(ctx.sessionKey)
+          : null,
+      { name: RESULT_TOOL, optional: true },
+    );
   },
 });

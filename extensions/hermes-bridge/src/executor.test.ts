@@ -1,5 +1,10 @@
 import { createHash } from "node:crypto";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { homedir } from "node:os";
+import { resolve } from "node:path";
 import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
+import { withEnvAsync } from "openclaw/plugin-sdk/test-env";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const { dispatchGatewayMethod } = vi.hoisted(() => ({
@@ -11,10 +16,12 @@ vi.mock("openclaw/plugin-sdk/gateway-method-runtime", () => ({
 }));
 import { resolveHermesBridgeConfig } from "./config.js";
 import { executeHermesBridgeTask } from "./executor.js";
+import { revokeFacebookPageCapability } from "./facebook-page-capability.js";
 import {
   hashHermesBridgeRequest,
   MemoryHermesBridgeIdempotencyStore,
 } from "./idempotency-store.js";
+import { createResultTool, RESULT_TOOL } from "./result-tool.js";
 import { normalizeHermesBridgeRequest } from "./schema.js";
 import { sweepHermesBridgeCleanupObligations } from "./task-registry.js";
 
@@ -525,6 +532,7 @@ describe("executeHermesBridgeTask", () => {
     });
     expect(subagent.run).toHaveBeenCalledWith(
       expect.objectContaining({
+        lane: "hermes-controlled-browser",
         message: expect.stringContaining(
           "Use loopContract.trace.telegram_message_path only as audit/correlation metadata",
         ),
@@ -535,6 +543,7 @@ describe("executeHermesBridgeTask", () => {
     expect(prompt).toContain("credential_unavailable");
     expect(prompt).toContain("verification_unavailable");
     expect(prompt).not.toContain("drop.example/string-checklist");
+    expect(subagent.run.mock.calls[0]?.[0]?.extraSystemPrompt).not.toContain("Approval phase:");
   });
 
   it("admits missioncrew-content image generation Loop Contracts with image_generate", async () => {
@@ -582,7 +591,7 @@ describe("executeHermesBridgeTask", () => {
         provider: "openai",
         model: "gpt-5.3-codex-spark",
         thinking: "low",
-        toolsAllow: ["read", "write", "web_search", "image_generate"],
+        toolsAllow: ["read", "write", "web_search", "image_generate", "missioncrew_submit_result"],
         message: expect.stringContaining("Do not report blocked solely because status is running"),
       }),
     );
@@ -629,6 +638,120 @@ describe("executeHermesBridgeTask", () => {
       expect(subagent.run).not.toHaveBeenCalled();
     },
   );
+
+  it("admits an approved Page publication with its canonical domain mutation", async () => {
+    const scoped = readonlyMarketplaceLoopRequest();
+    scoped.routing.backendAgentId = "missioncrew-facebook-page-operator";
+    scoped.identity.taskType = "facebook_page_api_publish";
+    scoped.identity.attemptId = "t_page:run:1";
+    scoped.input.delegatedTaskId = "t_page";
+    scoped.policy.externalEffectBudget = 1;
+    scoped.policy.approvalGrantId = "owner-approval";
+    scoped.policy.credentialRefs = ["missioncrew-facebook-page"];
+    scoped.allowedTools = ["facebook_page_graph_status", "facebook_page_graph_publish"];
+    const contract = scoped.input.loopContract as Record<string, unknown>;
+    contract.approval_provenance = {
+      contract_fingerprint: scoped.identity.contractFingerprint,
+      scope_binding: "exact_loop_contract_fingerprint",
+    };
+    (contract.routing as Record<string, unknown>).task_type = "facebook_page_api_publish";
+    contract.external_targets = ["https://www.facebook.com/123"];
+    contract.facebook_page_post = {
+      action: "create_post",
+      transport: "graph_api",
+      page_id: "123",
+      page_url: "https://www.facebook.com/123",
+    };
+    contract.domain_memory = {
+      schema_id: "solobizai.case.v1",
+      domain_key: "solobizai",
+      entity_type: "SoloBizAiCase",
+      mode: "mutate",
+    };
+    const subagent = {
+      run: vi.fn().mockResolvedValue({ runId: "page-run" }),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+    const config = resolveHermesBridgeConfig({
+      enabled: true,
+      mode: "live",
+      hermesMode: "real",
+      idempotencyDbPath: resolve(mkdtempSync(resolve(tmpdir(), "page-domain-test-")), "bridge.db"),
+      allowedTasks: ["openclaw.agent.loop_contract_start"],
+      allowedTools: scoped.allowedTools,
+    });
+    try {
+      const result = await executeHermesBridgeTask({ config, request: scoped, subagent });
+      expect(result, JSON.stringify(result)).toMatchObject({ ok: true, status: "accepted" });
+      expect(subagent.run).toHaveBeenCalledOnce();
+    } finally {
+      const sessionKey = subagent.run.mock.calls[0]?.[0]?.sessionKey;
+      if (sessionKey) revokeFacebookPageCapability(sessionKey, config);
+    }
+  });
+
+  it("admits approved secondhand publication deltas for Hermes canonical validation", async () => {
+    const scoped = readonlyMarketplaceLoopRequest();
+    scoped.routing.backendAgentId = "missioncrew-browser-operator";
+    scoped.policy.externalEffectBudget = 1;
+    scoped.policy.approvalGrantId = "owner-approval";
+    scoped.allowedTools = ["browser"];
+    scoped.policy.credentialRefs = ["hermes-controlled-browser"];
+    const contract = scoped.input.loopContract as Record<string, unknown>;
+    contract.approval_provenance = {
+      contract_fingerprint: scoped.identity.contractFingerprint,
+      scope_binding: "exact_loop_contract_fingerprint",
+    };
+    scoped.identity.taskType = "facebook_marketplace_group_publish";
+    (contract.routing as Record<string, unknown>).task_type = "facebook_marketplace_group_publish";
+    contract.external_targets = ["https://www.facebook.com/groups/123"];
+    contract.facebook_group_publish = {
+      mode: "listing_bound_chooser",
+      source_listing_id: "456",
+      destinations: [
+        {
+          group_id: "123",
+          canonical_name: "Telescope trade",
+          canonical_url: "https://www.facebook.com/groups/123",
+        },
+      ],
+    };
+    contract.domain_memory = {
+      schema_id: "secondhand.item.v1",
+      domain_key: "secondhand",
+      entity_type: "ResaleItem",
+      mode: "mutate",
+    };
+    const subagent = {
+      run: vi.fn().mockResolvedValue({ runId: "approved-run" }),
+      waitForRun: vi.fn(),
+      getSessionMessages: vi.fn(),
+      getSession: vi.fn(),
+      deleteSession: vi.fn(),
+    } satisfies PluginRuntime["subagent"];
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_start"],
+        allowedTools: ["read", "web_search", "browser"],
+      }),
+      request: scoped,
+      subagent,
+    });
+    expect(result, JSON.stringify(result)).toMatchObject({ ok: true, status: "accepted" });
+    expect(subagent.run).toHaveBeenCalledOnce();
+    expect(subagent.run.mock.calls[0]?.[0].extraSystemPrompt).toContain(
+      "controller has already consumed the owner approval for this exact contract",
+    );
+    expect(subagent.run.mock.calls[0]?.[0].extraSystemPrompt).toContain(
+      "Execute only the actions the contract explicitly permits after that approval",
+    );
+  });
 
   it("rejects reasoning efforts unsupported by the selected model", async () => {
     const request = imageGenerationLoopRequest();
@@ -893,6 +1016,154 @@ describe("executeHermesBridgeTask", () => {
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
   });
 
+  it("preserves a valid native result receipt when the terminal run also reports a usage limit", async () => {
+    const startRequest = readonlyMarketplaceLoopRequest();
+    const identityHash = createHash("sha256")
+      .update(
+        [
+          startRequest.identity.delegationId,
+          startRequest.identity.attemptId,
+          startRequest.identity.contractFingerprint,
+          startRequest.idempotencyKey,
+        ].join("\0"),
+      )
+      .digest("hex")
+      .slice(0, 24);
+    const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${identityHash}`;
+    const submitted = {
+      status: "succeeded",
+      summary: "Read-only checks complete",
+      acceptanceEvidence: { checked: true },
+      externalEffects: [],
+    };
+    const receipt = await createResultTool(sessionKey).execute("call", { result: submitted });
+    const subagent = {
+      run: vi.fn(),
+      waitForRun: vi.fn().mockResolvedValue({
+        status: "error",
+        terminal: true,
+        promptError: "You've reached your Codex subscription usage limit.",
+      }),
+      getSessionMessages: vi.fn().mockResolvedValue({
+        messages: [{ role: "toolResult", toolName: RESULT_TOOL, ...receipt }],
+      }),
+      getSession: vi.fn(),
+      deleteSession: vi.fn().mockResolvedValue(undefined),
+    } satisfies PluginRuntime["subagent"];
+
+    const result = await executeHermesBridgeTask({
+      config: resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_poll"],
+        allowedTools: ["read", "web_search", "browser"],
+      }),
+      request: request({
+        ...startRequest,
+        taskId: "openclaw.agent.loop_contract_poll",
+        idempotencyKey: "marketplace-readonly-start:poll:receipt-before-quota",
+        input: {
+          ...startRequest.input,
+          startIdempotencyKey: "marketplace-readonly-start",
+          backendRunId: "marketplace-readonly-run",
+          backendSessionKey: sessionKey,
+        },
+      }),
+      subagent,
+      taskRuns: taskRuntime(),
+    });
+
+    expect(result, JSON.stringify(result)).toMatchObject({
+      ok: true,
+      status: "succeeded",
+      output: {
+        bridgeStatus: "succeeded",
+        result: submitted,
+        evidence: {
+          terminal: true,
+          resultContractValid: true,
+          backendRunStatus: "error",
+        },
+      },
+    });
+    expect((result.output as Record<string, unknown>).evidence).not.toHaveProperty(
+      "runtimeBlocker",
+    );
+  });
+
+  it.each([false, true])(
+    "polls native result receipts through the existing effect audit: %s",
+    async (overBudget) => {
+      const start = readonlyMarketplaceLoopRequest();
+      const hash = createHash("sha256")
+        .update(
+          [
+            start.identity.delegationId,
+            start.identity.attemptId,
+            start.identity.contractFingerprint,
+            start.idempotencyKey,
+          ].join("\0"),
+        )
+        .digest("hex")
+        .slice(0, 24);
+      const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${hash}`;
+      const submitted = {
+        status: "succeeded",
+        summary: "Read-only checks complete",
+        acceptanceEvidence: { checked: true },
+        externalEffects: overBudget ? [{ target: "https://example.com" }] : [],
+      };
+      const receipt = await createResultTool(sessionKey).execute("call", { result: submitted });
+      const subagent = {
+        run: vi.fn(),
+        waitForRun: vi.fn().mockResolvedValue({ status: "ok", terminal: true }),
+        getSessionMessages: vi.fn().mockResolvedValue({
+          messages: [
+            { role: "toolResult", toolName: RESULT_TOOL, ...receipt },
+            { role: "assistant", content: [{ type: "text", text: '{"status":"succeeded"' }] },
+          ],
+        }),
+        getSession: vi.fn(),
+        deleteSession: vi.fn().mockResolvedValue(undefined),
+      } satisfies PluginRuntime["subagent"];
+      const polled = await executeHermesBridgeTask({
+        config: resolveHermesBridgeConfig({
+          enabled: true,
+          mode: "live",
+          hermesMode: "real",
+          allowedTasks: ["openclaw.agent.loop_contract_poll"],
+          allowedTools: ["read", "web_search", "browser"],
+        }),
+        request: request({
+          ...start,
+          taskId: "openclaw.agent.loop_contract_poll",
+          idempotencyKey: "receipt-poll",
+          input: {
+            ...start.input,
+            startIdempotencyKey: start.idempotencyKey,
+            backendRunId: "receipt-run",
+            backendSessionKey: sessionKey,
+          },
+        }),
+        subagent,
+        taskRuns: taskRuntime(),
+      });
+      if (overBudget) {
+        expect(polled.output).toMatchObject({
+          result: { status: "blocked" },
+          evidence: { resultContractError: expect.stringContaining("external effect budget") },
+        });
+      } else {
+        expect(polled.output).toMatchObject({
+          result: submitted,
+          evidence: { resultContractValid: true },
+        });
+      }
+      expect(subagent.run).not.toHaveBeenCalled();
+    },
+  );
+
   it.each([false, true])("preserves rejected terminal evidence: %s", async (hasRejectedResult) => {
     const rejected = {
       status: "succeeded",
@@ -995,7 +1266,13 @@ describe("executeHermesBridgeTask", () => {
       },
     );
     const blocked = (result.output as Record<string, unknown>).result as Record<string, unknown>;
-    expect(blocked.unvalidatedWorkerResult).toEqual(hasRejectedResult ? rejected : undefined);
+    expect(blocked).not.toHaveProperty("unvalidatedWorkerResult");
+    expect(blocked).not.toHaveProperty("unvalidatedWorkerResultText");
+    if (hasRejectedResult) {
+      expect(blocked.unvalidatedWorkerResultSha256).toBe(
+        createHash("sha256").update(JSON.stringify(rejected)).digest("hex"),
+      );
+    }
     expect(subagent.deleteSession).toHaveBeenCalledWith({ sessionKey });
   });
 
@@ -1082,7 +1359,17 @@ describe("executeHermesBridgeTask", () => {
     });
   });
 
-  it("accepts local image generation receipts without consuming external effect budget", async () => {
+  it.each([
+    "valid",
+    "foreign-owner",
+    "failed",
+    "wrong-source",
+    "wrong-id",
+    "missing-summary",
+    "bad-digest",
+    "outside-root",
+    "trailing-data",
+  ])("attests two runtime-owned images: %s", async (scenario) => {
     const startRequest = imageGenerationLoopRequest();
     const identityHash = createHash("sha256")
       .update(
@@ -1096,67 +1383,98 @@ describe("executeHermesBridgeTask", () => {
       .digest("hex")
       .slice(0, 24);
     const sessionKey = `agent:missioncrew-content:subagent:hermes-loop-${identityHash}`;
-    const terminalResult = {
+    const stateDir = resolve(homedir(), ".openclaw-hermes-bridge-test-state");
+    const rows = [
+      "e782061b-3576-4616-9d49-618e474e3454",
+      "c782061b-3576-4616-9d49-618e474e3454",
+    ].map((id, index) => ({
+      id,
+      ownerKey: sessionKey,
+      sourceId: "image_generate:openai",
       status: "succeeded",
-      summary: "Generated local AI BizWeek assets.",
-      acceptanceEvidence: [],
-      externalEffects: [
-        {
-          target: "openclaw.image_generate.local_media",
-          effectKey: "image_generate:local",
-          state: "verified",
-          readback: {
-            path: "/Users/kj/.openclaw/media/tool-image-generation/main.png",
-            model: "openai/gpt-image-2",
-          },
-        },
-      ],
-    };
+      endedAt: 1_789_000_228_000,
+      terminalSummary: `Generated 1 image. Attachments: 1. type=image name="asset${index}.png" mimeType=image/png dimensions=1254x1254 sha256=${"a".repeat(64)} path=${JSON.stringify(resolve(stateDir, `media/tool-image-generation/asset${index}.png`))}`,
+    }));
+    if (scenario === "foreign-owner")
+      rows.forEach((row) => {
+        row.ownerKey = "another-session";
+      });
+    if (scenario === "failed")
+      rows.forEach((row) => {
+        row.status = "failed";
+      });
+    if (scenario === "wrong-source")
+      rows.forEach((row) => {
+        row.sourceId = "exec";
+      });
+    if (scenario === "wrong-id")
+      rows.forEach((row) => {
+        row.id = "image_generate:forged";
+      });
+    if (scenario === "missing-summary") rows[1].terminalSummary = "";
+    if (scenario === "bad-digest")
+      rows[1].terminalSummary = rows[1].terminalSummary.replace("a".repeat(64), "<redacted>");
+    if (scenario === "outside-root")
+      rows[1].terminalSummary = rows[1].terminalSummary.replace(stateDir, "/tmp/outside");
+    if (scenario === "trailing-data") rows[1].terminalSummary += " forged";
     const subagent = {
       run: vi.fn(),
       waitForRun: vi.fn().mockResolvedValue({ status: "ok", terminal: true }),
       getSessionMessages: vi.fn().mockResolvedValue({
-        messages: [{ role: "assistant", content: JSON.stringify(terminalResult) }],
+        messages: [
+          {
+            role: "assistant",
+            content: JSON.stringify({
+              status: "succeeded",
+              summary: "Generated local assets",
+              acceptanceEvidence: [],
+              externalEffects: [],
+            }),
+          },
+        ],
       }),
       getSession: vi.fn(),
       deleteSession: vi.fn().mockResolvedValue(undefined),
     } satisfies PluginRuntime["subagent"];
-    const pollRequest = request({
-      ...startRequest,
-      taskId: "openclaw.agent.loop_contract_poll",
-      idempotencyKey: "image-generation-start:poll:local-image-receipts",
-      input: {
-        ...startRequest.input,
-        startIdempotencyKey: "image-generation-start",
-        backendRunId: "image-generation-run",
-        backendSessionKey: sessionKey,
-      },
-    });
-
-    const result = await executeHermesBridgeTask({
-      config: resolveHermesBridgeConfig({
-        enabled: true,
-        mode: "live",
-        hermesMode: "real",
-        allowedTasks: ["openclaw.agent.loop_contract_poll"],
-        allowedTools: ["read", "write", "web_search", "image_generate"],
+    const result = await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, () =>
+      executeHermesBridgeTask({
+        config: resolveHermesBridgeConfig({
+          enabled: true,
+          mode: "live",
+          hermesMode: "real",
+          allowedTasks: ["openclaw.agent.loop_contract_poll"],
+          allowedTools: ["read", "write", "web_search", "image_generate"],
+        }),
+        request: request({
+          ...startRequest,
+          taskId: "openclaw.agent.loop_contract_poll",
+          idempotencyKey: `image-generation-start:poll:${scenario}`,
+          input: {
+            ...startRequest.input,
+            startIdempotencyKey: "image-generation-start",
+            backendRunId: "image-generation-run",
+            backendSessionKey: sessionKey,
+          },
+        }),
+        subagent,
+        taskRuns: taskRuntime(rows),
       }),
-      request: pollRequest,
-      subagent,
-      taskRuns: taskRuntime(),
-    });
-
-    expect(result, JSON.stringify(result)).toMatchObject({
-      ok: true,
-      status: "succeeded",
-      output: {
-        evidence: {
-          externalEffectBudget: 0,
-          resultContractValid: true,
-        },
-        result: terminalResult,
-      },
-    });
+    );
+    expect(result.ok, JSON.stringify(result)).toBe(true);
+    const evidence = result.output.evidence as Record<string, unknown>;
+    expect(evidence.internalToolReceipts).toHaveLength(scenario === "valid" ? 2 : 0);
+    if (scenario === "valid")
+      expect(result.output.evidence).toMatchObject({
+        effectClassification: { durableBusinessMutations: 0, internalToolEffects: 2 },
+        internalToolReceipts: rows.map((row) => ({
+          effectKey: `image_generate:${row.id}`,
+          readback: {
+            attestedBy: "openclaw_runtime_task_registry",
+            ownerSessionKey: sessionKey,
+            sha256: "a".repeat(64),
+          },
+        })),
+      });
   });
 
   it("rejects a messagePath that does not match the Loop Contract trace", async () => {
