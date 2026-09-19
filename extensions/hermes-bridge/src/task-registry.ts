@@ -17,7 +17,7 @@ import {
   type HermesBridgeIdempotencyStore,
 } from "./idempotency-store.js";
 import { RESULT_TOOL, submittedResultText } from "./result-tool.js";
-import type { HermesBridgeRequest, HermesBridgeTask } from "./types.js";
+import type { HermesBridgeRequest, HermesBridgeTask, HermesBridgeTaskContext } from "./types.js";
 
 const READONLY_BROWSER_ALLOWED_URLS = new Set([
   "https://example.com/",
@@ -1783,6 +1783,198 @@ function validateReviewerResult(
   }
 }
 
+async function executeLoopContractLifecycle(
+  context: HermesBridgeTaskContext,
+  observe: (
+    validated: ReturnType<typeof requireLoopContractAsyncV2>,
+    backendRunId: string,
+    sessionKey: string,
+  ) => Promise<Record<string, unknown>>,
+): Promise<Record<string, unknown>> {
+  const { request, cleanupStore: store, subagent, config } = context;
+  const validated = requireLoopContractAsyncV2(request);
+  const input = normalizeRequestInput(request);
+  const backendRunId = readString(input, "backendRunId")?.trim();
+  const sessionKey = readString(input, "backendSessionKey")?.trim();
+  if (!backendRunId || sessionKey !== validated.sessionKey) {
+    throw new Error("Loop Contract lifecycle requires its exact backend run and session identity.");
+  }
+  if (!store) {
+    throw new Error("Loop Contract lifecycle requires the durable cleanup store.");
+  }
+  // Poll keys identify HTTP observations. The admitted run owns its result and
+  // cleanup, so a delayed response or a new poll cannot erase terminal evidence.
+  let key = `loop-contract:${createHash("sha256")
+    .update(JSON.stringify([sessionKey, backendRunId]))
+    .digest("hex")}`;
+  const requestHash = hashHermesBridgeRequest({
+    ...request,
+    taskId: "openclaw.agent.loop_contract_poll",
+    idempotencyKey: undefined,
+    requestId: undefined,
+    intent: "",
+    priority: "normal",
+    input: { ...input, objective: "" },
+  });
+  const terminal = mutateCleanupStore(() => store.getCleanupTerminal(key));
+  if (terminal) {
+    if (terminal.requestHash !== requestHash || terminal.backendRunId !== backendRunId) {
+      throw new Error("Loop Contract terminal belongs to another execution scope.");
+    }
+    const sessionDeletionProven =
+      asRecord(terminal.output.evidence)?.sessionCleaned === true &&
+      (terminal.request.policy.sessionPolicy === "ephemeral" ||
+        terminal.request.taskId === "openclaw.agent.loop_contract_cancel");
+    if (request.taskId !== "openclaw.agent.loop_contract_cancel" || sessionDeletionProven) {
+      return structuredClone(terminal.output);
+    }
+    // A terminal may preserve or skip cleaning its session. Keep that result
+    // intact and give cancel a durable obligation until deletion is proven.
+    key += ":cancel";
+    const cancelled = mutateCleanupStore(() => store.getCleanupTerminal(key));
+    if (cancelled) {
+      if (cancelled.requestHash !== requestHash || cancelled.backendRunId !== backendRunId) {
+        throw new Error("Loop Contract cancellation belongs to another execution scope.");
+      }
+      return structuredClone(cancelled.output);
+    }
+  }
+  let obligation = mutateCleanupStore(() => store.getCleanup(key));
+  if (!obligation) {
+    const registered = mutateCleanupStore(() =>
+      store.registerCleanup({
+        idempotencyKey: key,
+        requestHash,
+        generation: randomUUID(),
+        backendRunId,
+        request,
+        dueAt: Date.now(),
+      }),
+    );
+    if (!registered) {
+      throw new HermesBridgeCleanupPendingError();
+    }
+    obligation = mutateCleanupStore(() => store.getCleanup(key));
+  }
+  if (
+    !obligation ||
+    obligation.requestHash !== requestHash ||
+    obligation.backendRunId !== backendRunId
+  ) {
+    throw new Error("Loop Contract cleanup belongs to another execution scope.");
+  }
+  const generation = obligation.generation;
+  const ownerId = randomUUID();
+  if (
+    !mutateCleanupStore(() =>
+      store.claimCleanup(key, requestHash, generation, { ownerId, leaseMs: 35_000 }),
+    )
+  ) {
+    throw new HermesBridgeCleanupPendingError();
+  }
+  try {
+    const deadlineAt = Date.now() + 30_000;
+    obligation = mutateCleanupStore(() => store.getCleanup(key));
+    if (!obligation || obligation.generation !== generation) {
+      throw new HermesBridgeCleanupPendingError();
+    }
+    let auditedTerminal = obligation.auditedTerminal;
+    if (!auditedTerminal) {
+      const output =
+        terminal?.output ??
+        (await withDeadline(
+          () => observe(validated, backendRunId, sessionKey),
+          deadlineAt,
+          "Loop Contract terminal observation",
+        ));
+      if (asRecord(output.evidence)?.terminal !== true) {
+        return output;
+      }
+      auditedTerminal = {
+        idempotencyKey: key,
+        requestHash,
+        generation,
+        backendRunId,
+        request,
+        output,
+        completedAt: Date.now(),
+      };
+      // Persist before deleting the only transcript. A crash after deletion must
+      // resume cleanup from this audited output, never re-audit an empty session.
+      mutateCleanupStore(() =>
+        store.setCleanupAuditedTerminal(key, requestHash, generation, ownerId, auditedTerminal!),
+      );
+    }
+    const evidence = asRecord(auditedTerminal.output.evidence);
+    if (
+      evidence?.terminal !== true ||
+      auditedTerminal.idempotencyKey !== key ||
+      auditedTerminal.generation !== generation ||
+      auditedTerminal.backendRunId !== backendRunId ||
+      auditedTerminal.requestHash !== requestHash
+    ) {
+      throw new Error("Loop Contract audited terminal identity is invalid.");
+    }
+    if (
+      request.taskId === "openclaw.agent.loop_contract_cancel" &&
+      auditedTerminal.request.taskId !== "openclaw.agent.loop_contract_cancel"
+    ) {
+      // A cancel may recover an audited poll before its commit. Persist cleanup
+      // intent so a failed deletion can resume through either polling or sweeping.
+      auditedTerminal = { ...auditedTerminal, request };
+      mutateCleanupStore(() =>
+        store.setCleanupAuditedTerminal(key, requestHash, generation, ownerId, auditedTerminal!),
+      );
+    }
+    const shouldDeleteSession =
+      request.policy.sessionPolicy === "ephemeral" ||
+      auditedTerminal.request.taskId === "openclaw.agent.loop_contract_cancel";
+    let sessionCleaned = !shouldDeleteSession;
+    let cleanupWarning: string | undefined;
+    if (shouldDeleteSession) {
+      try {
+        await withDeadline(
+          () => subagent.deleteSession({ sessionKey }),
+          deadlineAt,
+          "Loop Contract session cleanup",
+        );
+        sessionCleaned = true;
+      } catch (error) {
+        if (
+          !isForeignSessionCleanupOwnershipError(error) ||
+          auditedTerminal.request.taskId === "openclaw.agent.loop_contract_cancel"
+        ) {
+          throw new HermesBridgeCleanupPendingError();
+        }
+        cleanupWarning =
+          "Ephemeral session cleanup was skipped because the restored plugin runtime no longer owns the session.";
+      }
+    }
+    try {
+      revokeFacebookPageCapability(sessionKey, config);
+    } catch {
+      throw new HermesBridgeCleanupPendingError();
+    }
+    const cleanupEvidence: Record<string, unknown> = { ...evidence, sessionCleaned };
+    delete cleanupEvidence.cleanupWarning;
+    if (cleanupWarning) {
+      cleanupEvidence.cleanupWarning = cleanupWarning;
+    }
+    const output = { ...auditedTerminal.output, evidence: cleanupEvidence };
+    mutateCleanupStore(() =>
+      store.completeCleanup(key, requestHash, generation, ownerId, { ...auditedTerminal!, output }),
+    );
+    return output;
+  } catch (error) {
+    if (error instanceof HermesBridgeDeadlineError) {
+      throw new HermesBridgeCleanupPendingError();
+    }
+    throw error;
+  } finally {
+    mutateCleanupStore(() => store.releaseCleanup(key, requestHash, generation, ownerId));
+  }
+}
+
 const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
   {
     taskId: "status.echo",
@@ -3425,294 +3617,283 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
     dangerous: false,
     mockOnly: false,
     requiredTools: [],
-    async execute({ request, subagent, taskRuns, config }) {
-      const validated = requireLoopContractAsyncV2(request);
-      const input = normalizeRequestInput(request);
-      const backendRunId = readString(input, "backendRunId")?.trim();
-      const backendSessionKey = readString(input, "backendSessionKey")?.trim();
-      if (!backendRunId || !backendSessionKey) {
-        throw new Error("Loop Contract poll requires backendRunId and backendSessionKey.");
-      }
-      if (backendSessionKey !== validated.sessionKey) {
-        throw new Error("Loop Contract poll backendSessionKey does not match its start identity.");
-      }
-      const wait = await subagent.waitForRun({ runId: backendRunId, timeoutMs: 1 });
-      let terminalRecoveredFromSession = false;
-      let terminalRecoveredFromTranscript = false;
-      let transcript: { messages: unknown[] } | undefined;
-      if (!waitResultIsTerminal(wait)) {
-        let session: unknown;
-        try {
-          session = await subagent.getSession({ sessionKey: backendSessionKey });
-        } catch {
-          session = undefined;
-        }
-        terminalRecoveredFromSession = sessionStatusIsTerminal(session);
-        if (!terminalRecoveredFromSession) {
-          try {
-            transcript = await subagent.getSessionMessages({
-              sessionKey: backendSessionKey,
-              limit: 1_000,
-            });
-            if (transcript.messages.length >= 1_000) {
-              throw new Error("Loop Contract transcript reached the audit limit.");
+    async execute(context) {
+      const { request, subagent, taskRuns } = context;
+      return executeLoopContractLifecycle(
+        context,
+        async (validated, backendRunId, backendSessionKey) => {
+          const wait = await subagent.waitForRun({ runId: backendRunId, timeoutMs: 1 });
+          let terminalRecoveredFromSession = false;
+          let terminalRecoveredFromTranscript = false;
+          let transcript: { messages: unknown[] } | undefined;
+          if (!waitResultIsTerminal(wait)) {
+            let session: unknown;
+            try {
+              session = await subagent.getSession({ sessionKey: backendSessionKey });
+            } catch {
+              session = undefined;
             }
-            terminalRecoveredFromTranscript = auditLoopContractResult(
-              finalAssistantText(transcript.messages),
-              request,
-            ).ok;
-          } catch {
-            transcript = undefined;
-          }
-        }
-      }
-      if (
-        !waitResultIsTerminal(wait) &&
-        !terminalRecoveredFromSession &&
-        !terminalRecoveredFromTranscript
-      ) {
-        const tokenUsage = tokenUsageFromUnknown(wait, "openclaw-wait");
-        return {
-          bridgeStatus: "running",
-          bridgeSummary: "OpenClaw Loop Contract execution is still running.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId,
-            backendAgentId: validated.agentId,
-            sessionKey: backendSessionKey,
-          },
-          ...(tokenUsage ? { tokenUsage } : {}),
-          evidence: { terminal: false },
-        };
-      }
-      transcript ??= await subagent.getSessionMessages({
-        sessionKey: backendSessionKey,
-        limit: 1_000,
-      });
-      if (transcript.messages.length >= 1_000) {
-        throw new Error("Loop Contract transcript reached the audit limit.");
-      }
-      const submittedText = submittedResultText(transcript.messages, backendSessionKey);
-      const resultText = submittedText ?? finalAssistantText(transcript.messages);
-      const audited = auditLoopContractResult(resultText, request);
-      // agent.wait completes one turn, including sessions_yield. Detached work
-      // belongs to this requester session and must survive until its final reply.
-      if (!taskRuns && request.allowedTools.includes("image_generate")) {
-        throw new Error("Loop Contract image task polling requires the task-run runtime.");
-      }
-      const ownedTasks =
-        taskRuns
-          ?.bindSession({ sessionKey: backendSessionKey })
-          .list()
-          .filter((task) => task.ownerKey === backendSessionKey) ?? [];
-      const activeTasks = ownedTasks.filter((task) => ["queued", "running"].includes(task.status));
-      const durableBusinessMutations = Array.isArray(audited.parsed?.externalEffects)
-        ? audited.parsed.externalEffects.filter(
-            (effect) => !isInternalImageGenerationEffect(effect),
-          ).length
-        : 0;
-      const imageToolEvidence = runtimeImageToolEvidence(
-        ownedTasks,
-        backendSessionKey,
-        request.allowedTools.includes("image_generate") && durableBusinessMutations === 0,
-      );
-      const internalToolReceipts = imageToolEvidence.receipts;
-      // Allow the requester five minutes after the last detached task finishes
-      // (including failure/cancellation), then use the normal invalid-result path.
-      const requesterDeadline =
-        Math.max(0, ...ownedTasks.map((task) => task.endedAt ?? task.createdAt)) + 300_000;
-      if (
-        wait.status !== "error" &&
-        (activeTasks.length > 0 ||
-          (ownedTasks.length > 0 && !audited.ok && Date.now() < requesterDeadline))
-      ) {
-        return {
-          bridgeStatus: "running",
-          bridgeSummary: "OpenClaw is awaiting detached work and its requester completion.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId,
-            backendAgentId: validated.agentId,
-            sessionKey: backendSessionKey,
-          },
-          evidence: {
-            terminal: false,
-            pendingTaskIds: activeTasks.map((task) => task.id),
-            awaitingRequesterCompletion: true,
-          },
-        };
-      }
-      const backendTerminalAccepted =
-        wait.status === "ok" ||
-        terminalRecoveredFromSession ||
-        terminalRecoveredFromTranscript ||
-        (submittedText !== undefined && audited.ok);
-      const workerBlocked =
-        backendTerminalAccepted && audited.ok && audited.parsed?.status === "blocked";
-      const succeeded =
-        backendTerminalAccepted && audited.ok && audited.parsed?.status === "succeeded";
-      const tokenUsage =
-        tokenUsageFromMessages(transcript.messages) ?? tokenUsageFromUnknown(wait, "openclaw-wait");
-      const usageLimitMessage =
-        usageLimitMessageFromUnknown(wait) ?? usageLimitMessageFromUnknown(transcript.messages);
-      let sessionCleaned = request.policy.sessionPolicy !== "ephemeral";
-      let cleanupWarning: string | undefined;
-      if (request.policy.sessionPolicy === "ephemeral") {
-        try {
-          await subagent.deleteSession({ sessionKey: backendSessionKey });
-          sessionCleaned = true;
-        } catch (error) {
-          if (!isForeignSessionCleanupOwnershipError(error)) {
-            throw error;
-          }
-          cleanupWarning =
-            "Ephemeral session cleanup was skipped because the restored plugin runtime no longer owns the session.";
-        }
-      }
-      revokeFacebookPageCapability(backendSessionKey, config);
-      if (usageLimitMessage && submittedText === undefined) {
-        const blockedResult = loopContractUsageLimitResult(request, usageLimitMessage);
-        return {
-          bridgeStatus: "blocked",
-          bridgeSummary:
-            "OpenClaw Loop Contract blocked before execution because the Codex usage limit was reached.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId,
-            backendAgentId: validated.agentId,
-            sessionKey: backendSessionKey,
-          },
-          ...(tokenUsage ? { tokenUsage } : {}),
-          evidence: {
-            terminal: true,
-            transcriptMessageCount: transcript.messages.length,
-            sessionCleaned,
-            ...(cleanupWarning ? { cleanupWarning } : {}),
-            ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
-            ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
-            toolsAllowed: request.allowedTools,
-            externalEffectBudget: request.policy.externalEffectBudget,
-            resultContractValid: true,
-            runtimeBlocker: "codex_usage_limit",
-            promptError: usageLimitMessage,
-          },
-          resultText: JSON.stringify(blockedResult),
-          result: blockedResult,
-        };
-      }
-      if (workerBlocked) {
-        return {
-          bridgeStatus: "blocked",
-          bridgeSummary: "OpenClaw Loop Contract worker reported a verified zero-effect blocker.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId,
-            backendAgentId: validated.agentId,
-            sessionKey: backendSessionKey,
-          },
-          ...(tokenUsage ? { tokenUsage } : {}),
-          evidence: {
-            terminal: true,
-            transcriptMessageCount: transcript.messages.length,
-            sessionCleaned,
-            ...(cleanupWarning ? { cleanupWarning } : {}),
-            ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
-            ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
-            toolsAllowed: request.allowedTools,
-            externalEffectBudget: request.policy.externalEffectBudget,
-            resultContractValid: true,
-            runtimeBlocker: "worker_reported_blocker",
-          },
-          resultText,
-          result: audited.parsed,
-        };
-      }
-      if (!succeeded) {
-        const blockedResult = loopContractInvalidTerminalResult(request, {
-          reason: audited.reason ?? "Loop Contract result did not satisfy the acceptance contract.",
-          backendRunStatus: wait.status,
-          backendError: wait.error,
-          resultText,
-          transcriptMessageCount: transcript.messages.length,
-        });
-        return {
-          bridgeStatus: "blocked",
-          bridgeSummary:
-            "OpenClaw Loop Contract was blocked after terminal execution because the worker returned an invalid result contract.",
-          backendExecution: {
-            executorBackend: "openclaw" as const,
-            backendRunId,
-            backendAgentId: validated.agentId,
-            sessionKey: backendSessionKey,
-          },
-          ...(tokenUsage ? { tokenUsage } : {}),
-          evidence: {
-            terminal: true,
-            transcriptMessageCount: transcript.messages.length,
-            sessionCleaned,
-            ...(cleanupWarning ? { cleanupWarning } : {}),
-            ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
-            ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
-            toolsAllowed: request.allowedTools,
-            externalEffectBudget: request.policy.externalEffectBudget,
-            resultContractValid: true,
-            resultContractError: audited.reason,
-            runtimeBlocker: "invalid_terminal_result",
-            backendRunStatus: wait.status,
-            ...(wait.error ? { backendError: wait.error } : {}),
-            ...(validated.model
-              ? {
-                  requestedProvider: validated.provider,
-                  requestedModel: validated.model,
-                  requestedThinking: validated.thinking,
+            terminalRecoveredFromSession = sessionStatusIsTerminal(session);
+            if (!terminalRecoveredFromSession) {
+              try {
+                transcript = await subagent.getSessionMessages({
+                  sessionKey: backendSessionKey,
+                  limit: 1_000,
+                });
+                if (transcript.messages.length >= 1_000) {
+                  throw new Error("Loop Contract transcript reached the audit limit.");
                 }
-              : {}),
-          },
-          resultText: JSON.stringify(blockedResult),
-          result: blockedResult,
-        };
-      }
-      return {
-        bridgeStatus: "succeeded",
-        bridgeSummary: "OpenClaw Loop Contract execution completed.",
-        backendExecution: {
-          executorBackend: "openclaw" as const,
-          backendRunId,
-          backendAgentId: validated.agentId,
-          sessionKey: backendSessionKey,
-        },
-        ...(tokenUsage ? { tokenUsage } : {}),
-        evidence: {
-          terminal: true,
-          transcriptMessageCount: transcript.messages.length,
-          sessionCleaned,
-          ...(cleanupWarning ? { cleanupWarning } : {}),
-          ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
-          ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
-          toolsAllowed: request.allowedTools,
-          externalEffectBudget: request.policy.externalEffectBudget,
-          externalEffectBudgetScope: "durable_business_mutations",
-          internalToolReceipts,
-          effectClassification: {
-            durableBusinessMutations,
-            internalToolEffects: internalToolReceipts.length,
-            providerDataEgress: imageToolEvidence.providerDataEgress,
-          },
-          resultContractValid: audited.ok,
-          resultContractError: audited.reason,
-          backendRunStatus: wait.status,
-          ...(wait.error ? { backendError: wait.error } : {}),
-          ...(validated.model
-            ? {
-                requestedProvider: validated.provider,
-                requestedModel: validated.model,
-                requestedThinking: validated.thinking,
+                terminalRecoveredFromTranscript = auditLoopContractResult(
+                  finalAssistantText(transcript.messages),
+                  request,
+                ).ok;
+              } catch {
+                transcript = undefined;
               }
-            : {}),
+            }
+          }
+          if (
+            !waitResultIsTerminal(wait) &&
+            !terminalRecoveredFromSession &&
+            !terminalRecoveredFromTranscript
+          ) {
+            const tokenUsage = tokenUsageFromUnknown(wait, "openclaw-wait");
+            return {
+              bridgeStatus: "running",
+              bridgeSummary: "OpenClaw Loop Contract execution is still running.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId,
+                backendAgentId: validated.agentId,
+                sessionKey: backendSessionKey,
+              },
+              ...(tokenUsage ? { tokenUsage } : {}),
+              evidence: { terminal: false },
+            };
+          }
+          transcript ??= await subagent.getSessionMessages({
+            sessionKey: backendSessionKey,
+            limit: 1_000,
+          });
+          if (transcript.messages.length >= 1_000) {
+            throw new Error("Loop Contract transcript reached the audit limit.");
+          }
+          const submittedText = submittedResultText(transcript.messages, backendSessionKey);
+          const resultText = submittedText ?? finalAssistantText(transcript.messages);
+          const audited = auditLoopContractResult(resultText, request);
+          // agent.wait completes one turn, including sessions_yield. Detached work
+          // belongs to this requester session and must survive until its final reply.
+          if (!taskRuns && request.allowedTools.includes("image_generate")) {
+            throw new Error("Loop Contract image task polling requires the task-run runtime.");
+          }
+          const ownedTasks =
+            taskRuns
+              ?.bindSession({ sessionKey: backendSessionKey })
+              .list()
+              .filter((task) => task.ownerKey === backendSessionKey) ?? [];
+          const activeTasks = ownedTasks.filter((task) =>
+            ["queued", "running"].includes(task.status),
+          );
+          const durableBusinessMutations = Array.isArray(audited.parsed?.externalEffects)
+            ? audited.parsed.externalEffects.filter(
+                (effect) => !isInternalImageGenerationEffect(effect),
+              ).length
+            : 0;
+          const imageToolEvidence = runtimeImageToolEvidence(
+            ownedTasks,
+            backendSessionKey,
+            request.allowedTools.includes("image_generate") && durableBusinessMutations === 0,
+          );
+          const internalToolReceipts = imageToolEvidence.receipts;
+          // Allow the requester five minutes after the last detached task finishes
+          // (including failure/cancellation), then use the normal invalid-result path.
+          const requesterDeadline =
+            Math.max(0, ...ownedTasks.map((task) => task.endedAt ?? task.createdAt)) + 300_000;
+          if (
+            wait.status !== "error" &&
+            (activeTasks.length > 0 ||
+              (ownedTasks.length > 0 && !audited.ok && Date.now() < requesterDeadline))
+          ) {
+            return {
+              bridgeStatus: "running",
+              bridgeSummary: "OpenClaw is awaiting detached work and its requester completion.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId,
+                backendAgentId: validated.agentId,
+                sessionKey: backendSessionKey,
+              },
+              evidence: {
+                terminal: false,
+                pendingTaskIds: activeTasks.map((task) => task.id),
+                awaitingRequesterCompletion: true,
+              },
+            };
+          }
+          const backendTerminalAccepted =
+            wait.status === "ok" ||
+            terminalRecoveredFromSession ||
+            terminalRecoveredFromTranscript ||
+            (submittedText !== undefined && audited.ok);
+          const workerBlocked =
+            backendTerminalAccepted && audited.ok && audited.parsed?.status === "blocked";
+          const succeeded =
+            backendTerminalAccepted && audited.ok && audited.parsed?.status === "succeeded";
+          const tokenUsage =
+            tokenUsageFromMessages(transcript.messages) ??
+            tokenUsageFromUnknown(wait, "openclaw-wait");
+          const usageLimitMessage =
+            usageLimitMessageFromUnknown(wait) ?? usageLimitMessageFromUnknown(transcript.messages);
+          const sessionCleaned = request.policy.sessionPolicy !== "ephemeral";
+          if (usageLimitMessage && submittedText === undefined) {
+            const blockedResult = loopContractUsageLimitResult(request, usageLimitMessage);
+            return {
+              bridgeStatus: "blocked",
+              bridgeSummary:
+                "OpenClaw Loop Contract blocked before execution because the Codex usage limit was reached.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId,
+                backendAgentId: validated.agentId,
+                sessionKey: backendSessionKey,
+              },
+              ...(tokenUsage ? { tokenUsage } : {}),
+              evidence: {
+                terminal: true,
+                transcriptMessageCount: transcript.messages.length,
+                sessionCleaned,
+                ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
+                ...(terminalRecoveredFromTranscript
+                  ? { terminalRecoveredFromTranscript: true }
+                  : {}),
+                toolsAllowed: request.allowedTools,
+                externalEffectBudget: request.policy.externalEffectBudget,
+                resultContractValid: true,
+                runtimeBlocker: "codex_usage_limit",
+                promptError: usageLimitMessage,
+              },
+              resultText: JSON.stringify(blockedResult),
+              result: blockedResult,
+            };
+          }
+          if (workerBlocked) {
+            return {
+              bridgeStatus: "blocked",
+              bridgeSummary:
+                "OpenClaw Loop Contract worker reported a verified zero-effect blocker.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId,
+                backendAgentId: validated.agentId,
+                sessionKey: backendSessionKey,
+              },
+              ...(tokenUsage ? { tokenUsage } : {}),
+              evidence: {
+                terminal: true,
+                transcriptMessageCount: transcript.messages.length,
+                sessionCleaned,
+                ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
+                ...(terminalRecoveredFromTranscript
+                  ? { terminalRecoveredFromTranscript: true }
+                  : {}),
+                toolsAllowed: request.allowedTools,
+                externalEffectBudget: request.policy.externalEffectBudget,
+                resultContractValid: true,
+                runtimeBlocker: "worker_reported_blocker",
+              },
+              resultText,
+              result: audited.parsed,
+            };
+          }
+          if (!succeeded) {
+            const blockedResult = loopContractInvalidTerminalResult(request, {
+              reason:
+                audited.reason ?? "Loop Contract result did not satisfy the acceptance contract.",
+              backendRunStatus: wait.status,
+              backendError: wait.error,
+              resultText,
+              transcriptMessageCount: transcript.messages.length,
+            });
+            return {
+              bridgeStatus: "blocked",
+              bridgeSummary:
+                "OpenClaw Loop Contract was blocked after terminal execution because the worker returned an invalid result contract.",
+              backendExecution: {
+                executorBackend: "openclaw" as const,
+                backendRunId,
+                backendAgentId: validated.agentId,
+                sessionKey: backendSessionKey,
+              },
+              ...(tokenUsage ? { tokenUsage } : {}),
+              evidence: {
+                terminal: true,
+                transcriptMessageCount: transcript.messages.length,
+                sessionCleaned,
+                ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
+                ...(terminalRecoveredFromTranscript
+                  ? { terminalRecoveredFromTranscript: true }
+                  : {}),
+                toolsAllowed: request.allowedTools,
+                externalEffectBudget: request.policy.externalEffectBudget,
+                resultContractValid: true,
+                resultContractError: audited.reason,
+                runtimeBlocker: "invalid_terminal_result",
+                backendRunStatus: wait.status,
+                ...(wait.error ? { backendError: wait.error } : {}),
+                ...(validated.model
+                  ? {
+                      requestedProvider: validated.provider,
+                      requestedModel: validated.model,
+                      requestedThinking: validated.thinking,
+                    }
+                  : {}),
+              },
+              resultText: JSON.stringify(blockedResult),
+              result: blockedResult,
+            };
+          }
+          return {
+            bridgeStatus: "succeeded",
+            bridgeSummary: "OpenClaw Loop Contract execution completed.",
+            backendExecution: {
+              executorBackend: "openclaw" as const,
+              backendRunId,
+              backendAgentId: validated.agentId,
+              sessionKey: backendSessionKey,
+            },
+            ...(tokenUsage ? { tokenUsage } : {}),
+            evidence: {
+              terminal: true,
+              transcriptMessageCount: transcript.messages.length,
+              sessionCleaned,
+              ...(terminalRecoveredFromSession ? { terminalRecoveredFromSession: true } : {}),
+              ...(terminalRecoveredFromTranscript ? { terminalRecoveredFromTranscript: true } : {}),
+              toolsAllowed: request.allowedTools,
+              externalEffectBudget: request.policy.externalEffectBudget,
+              externalEffectBudgetScope: "durable_business_mutations",
+              internalToolReceipts,
+              effectClassification: {
+                durableBusinessMutations,
+                internalToolEffects: internalToolReceipts.length,
+                providerDataEgress: imageToolEvidence.providerDataEgress,
+              },
+              resultContractValid: audited.ok,
+              resultContractError: audited.reason,
+              backendRunStatus: wait.status,
+              ...(wait.error ? { backendError: wait.error } : {}),
+              ...(validated.model
+                ? {
+                    requestedProvider: validated.provider,
+                    requestedModel: validated.model,
+                    requestedThinking: validated.thinking,
+                  }
+                : {}),
+            },
+            resultText,
+            result: audited.parsed,
+          };
         },
-        resultText,
-        result: audited.parsed,
-      };
+      );
     },
   },
   {
@@ -3721,35 +3902,23 @@ const HERMES_BRIDGE_TASKS: readonly HermesBridgeTask[] = [
     dangerous: false,
     mockOnly: false,
     requiredTools: [],
-    async execute({ request, subagent, config }) {
-      const validated = requireLoopContractAsyncV2(request);
-      const input = normalizeRequestInput(request);
-      const backendSessionKey = readString(input, "backendSessionKey")?.trim();
-      if (!backendSessionKey) {
-        throw new Error("Loop Contract cancel requires backendSessionKey.");
-      }
-      if (backendSessionKey !== validated.sessionKey) {
-        throw new Error(
-          "Loop Contract cancel backendSessionKey does not match its start identity.",
-        );
-      }
-      const backendRunId = readString(input, "backendRunId")?.trim();
-      if (!backendRunId) {
-        throw new Error("Loop Contract cancel requires backendRunId.");
-      }
-      await subagent.deleteSession({ sessionKey: backendSessionKey });
-      revokeFacebookPageCapability(backendSessionKey, config);
-      return {
-        bridgeStatus: "succeeded",
-        bridgeSummary: "OpenClaw Loop Contract session was cancelled and cleaned up.",
-        backendExecution: {
-          executorBackend: "openclaw" as const,
-          backendRunId,
-          backendAgentId: validated.agentId,
-          sessionKey: backendSessionKey,
+    async execute(context) {
+      return executeLoopContractLifecycle(
+        context,
+        async (validated, backendRunId, backendSessionKey) => {
+          return {
+            bridgeStatus: "succeeded",
+            bridgeSummary: "OpenClaw Loop Contract session was cancelled and cleaned up.",
+            backendExecution: {
+              executorBackend: "openclaw" as const,
+              backendRunId,
+              backendAgentId: validated.agentId,
+              sessionKey: backendSessionKey,
+            },
+            evidence: { terminal: true, sessionCleaned: false, cancellationRequested: true },
+          };
         },
-        evidence: { terminal: true, sessionCleaned: true },
-      };
+      );
     },
   },
   {
@@ -3852,6 +4021,35 @@ export async function sweepHermesBridgeCleanupObligations(params: {
 }): Promise<number> {
   let completed = 0;
   for (const obligation of params.store.listDueCleanup(params.nowMs)) {
+    if (
+      obligation.request.taskId === "openclaw.agent.loop_contract_poll" ||
+      obligation.request.taskId === "openclaw.agent.loop_contract_cancel"
+    ) {
+      // The controller owns active runs. Only resume cleanup after the exact
+      // terminal result was audited; never restart or cancel work from a sweep.
+      if (!obligation.auditedTerminal) {
+        continue;
+      }
+      try {
+        await executeLoopContractLifecycle(
+          {
+            request: obligation.auditedTerminal.request,
+            subagent: params.subagent,
+            config: params.config,
+            cleanupStore: params.store,
+            mode: params.config.mode,
+            recoveredLease: false,
+          },
+          async () => {
+            throw new Error("Loop Contract cleanup lost its audited terminal result.");
+          },
+        );
+        completed += 1;
+      } catch {
+        // The audited output remains durable until its owner completes cleanup.
+      }
+      continue;
+    }
     if (obligation.request.taskId === "openclaw.agent.zero_effect_async_start") {
       const cleanupOwnerId = randomUUID();
       const claimed = params.store.claimCleanup(

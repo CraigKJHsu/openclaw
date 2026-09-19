@@ -20,6 +20,7 @@ import { revokeFacebookPageCapability } from "./facebook-page-capability.js";
 import {
   hashHermesBridgeRequest,
   MemoryHermesBridgeIdempotencyStore,
+  SqliteHermesBridgeIdempotencyStore,
 } from "./idempotency-store.js";
 import { createResultTool, RESULT_TOOL } from "./result-tool.js";
 import { normalizeHermesBridgeRequest } from "./schema.js";
@@ -384,6 +385,334 @@ function mockSuccessfulBrowser(targetId = "tab-test") {
 }
 
 describe("executeHermesBridgeTask", () => {
+  let loopCleanupStore: MemoryHermesBridgeIdempotencyStore;
+  it.each([
+    { status: "blocked", interruption: "none", persistent: false },
+    { status: "succeeded", interruption: "none", persistent: false },
+    { status: "blocked", interruption: "before-cleanup", persistent: false },
+    { status: "blocked", interruption: "after-cleanup", persistent: false },
+    { status: "succeeded", interruption: "late-cleanup", persistent: false },
+    { status: "blocked", interruption: "none", persistent: true },
+    { status: "succeeded", interruption: "after-cleanup", persistent: true },
+    { status: "blocked", interruption: "cancel-cleanup-failure", persistent: true },
+    { status: "blocked", interruption: "audited-cancel-cleanup-failure", persistent: true },
+    { status: "blocked", interruption: "foreign-cancel-cleanup-failure", persistent: true },
+  ])(
+    "replays a durable Loop Contract $status result after $interruption across poll keys and restart (persistent=$persistent)",
+    async ({ status, interruption, persistent }) => {
+      const pollCommitInterrupted =
+        interruption === "after-cleanup" || interruption === "audited-cancel-cleanup-failure";
+      const cancelCleanupInterrupted = interruption.endsWith("cancel-cleanup-failure");
+      const start = readonlyMarketplaceLoopRequest();
+      const hash = createHash("sha256")
+        .update(
+          [
+            start.identity.delegationId,
+            start.identity.attemptId,
+            start.identity.contractFingerprint,
+            start.idempotencyKey,
+          ].join("\0"),
+        )
+        .digest("hex")
+        .slice(0, 24);
+      const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${hash}`;
+      const submitted = {
+        status,
+        summary: "Read-only observation finished",
+        acceptanceEvidence:
+          status === "blocked"
+            ? {
+                blocker: {
+                  owner: "openclaw_worker",
+                  scope: "contracted_deliverable",
+                  kind: "facebook_readonly_verification_unavailable",
+                  reason: "Browser navigation was denied by policy.",
+                },
+              }
+            : { checked: true },
+        externalEffects: [],
+      };
+      const receipt = await createResultTool(sessionKey).execute("call", { result: submitted });
+      const subagent = successfulReadonlySubagent([
+        { role: "toolResult", toolName: RESULT_TOOL, ...receipt },
+        { role: "assistant", content: [{ type: "text", text: "" }] },
+      ]);
+      subagent.deleteSession.mockImplementation(async () => {
+        subagent.getSessionMessages.mockResolvedValue({ messages: [] });
+      });
+      const config = resolveHermesBridgeConfig({
+        enabled: true,
+        mode: "live",
+        hermesMode: "real",
+        allowedTasks: ["openclaw.agent.loop_contract_poll", "openclaw.agent.loop_contract_cancel"],
+        allowedTools: start.allowedTools,
+      });
+      const poll = request({
+        ...start,
+        taskId: "openclaw.agent.loop_contract_poll",
+        idempotencyKey: "durable-loop:poll:1",
+        policy: { ...start.policy, sessionPolicy: persistent ? "persistent" : "ephemeral" },
+        input: {
+          ...start.input,
+          startIdempotencyKey: start.idempotencyKey,
+          backendRunId: "durable-loop-run",
+          backendSessionKey: sessionKey,
+        },
+      });
+      const dbPath = resolve(
+        mkdtempSync(resolve(tmpdir(), "hermes-loop-terminal-")),
+        "state.sqlite",
+      );
+      let store = new SqliteHermesBridgeIdempotencyStore(dbPath);
+      try {
+        if (interruption === "before-cleanup") {
+          vi.spyOn(store, "setCleanupAuditedTerminal").mockImplementationOnce(() => {
+            throw new Error("Audited result persistence interrupted");
+          });
+        } else if (pollCommitInterrupted) {
+          vi.spyOn(store, "completeCleanup").mockImplementationOnce(() => {
+            throw new Error("Terminal commit interrupted after session deletion");
+          });
+        }
+        const cleanupStarted = Promise.withResolvers<void>();
+        const cleanupReleased = Promise.withResolvers<void>();
+        if (interruption === "late-cleanup") {
+          subagent.deleteSession.mockImplementationOnce(async () => {
+            subagent.getSessionMessages.mockResolvedValue({ messages: [] });
+            cleanupStarted.resolve();
+            await cleanupReleased.promise;
+          });
+        }
+        const firstPending = executeHermesBridgeTask({
+          config,
+          request: poll,
+          subagent,
+          cleanupStore: store,
+        });
+        if (interruption === "late-cleanup") {
+          await cleanupStarted.promise;
+          try {
+            const concurrent = await executeHermesBridgeTask({
+              config,
+              request: request({ ...poll, idempotencyKey: "durable-loop:poll:concurrent" }),
+              subagent,
+              cleanupStore: store,
+            });
+            expect(concurrent).toMatchObject({
+              status: "running",
+              error: { type: "cleanup_in_progress" },
+            });
+            expect(subagent.getSessionMessages).toHaveBeenCalledTimes(1);
+          } finally {
+            cleanupReleased.resolve();
+          }
+        }
+        const first = await firstPending;
+        if (interruption === "before-cleanup" || pollCommitInterrupted) {
+          expect(first).toMatchObject({
+            status: "running",
+            error: { type: "cleanup_store_unavailable" },
+          });
+          expect(subagent.deleteSession).toHaveBeenCalledTimes(
+            interruption === "before-cleanup" || persistent ? 0 : 1,
+          );
+        } else {
+          expect(first).toMatchObject({ status, output: { result: submitted } });
+          expect(subagent.deleteSession).toHaveBeenCalledTimes(persistent ? 0 : 1);
+        }
+        store.close();
+        store = new SqliteHermesBridgeIdempotencyStore(dbPath);
+        if (cancelCleanupInterrupted) {
+          subagent.deleteSession.mockRejectedValueOnce(
+            new Error(
+              interruption === "foreign-cancel-cleanup-failure"
+                ? `Cannot delete session ${sessionKey} because it did not create it`
+                : "Session cleanup unavailable",
+            ),
+          );
+          expect(
+            await executeHermesBridgeTask({
+              config,
+              request: request({
+                ...poll,
+                taskId: "openclaw.agent.loop_contract_cancel",
+                idempotencyKey: "durable-loop:cancel:interrupted",
+              }),
+              subagent,
+              cleanupStore: store,
+            }),
+          ).toMatchObject({ status: "running", error: { type: "cleanup_in_progress" } });
+          store.close();
+          store = new SqliteHermesBridgeIdempotencyStore(dbPath);
+          expect(await sweepHermesBridgeCleanupObligations({ store, subagent, config })).toBe(1);
+          expect(subagent.getSessionMessages).toHaveBeenCalledTimes(1);
+        }
+        if (interruption === "after-cleanup" && !persistent) {
+          expect(await sweepHermesBridgeCleanupObligations({ store, subagent, config })).toBe(1);
+          expect(subagent.getSessionMessages).toHaveBeenCalledTimes(1);
+        }
+        let terminalOutput = first.output;
+        const replayTaskIds = [
+          "openclaw.agent.loop_contract_poll",
+          "openclaw.agent.loop_contract_cancel",
+          "openclaw.agent.loop_contract_cancel",
+        ];
+        if (persistent && pollCommitInterrupted) {
+          replayTaskIds.reverse();
+        }
+        for (const [index, taskId] of replayTaskIds.entries()) {
+          const replayed = await executeHermesBridgeTask({
+            config,
+            request: request({
+              ...poll,
+              taskId,
+              idempotencyKey: `durable-loop:${taskId}:${index}`,
+            }),
+            subagent,
+            cleanupStore: store,
+          });
+          expect(replayed).toMatchObject({
+            status,
+            output: {
+              result: submitted,
+              evidence: { terminal: true, sessionCleaned: true, transcriptMessageCount: 2 },
+            },
+          });
+          terminalOutput ??= replayed.output;
+          expect(replayed.output).toEqual(terminalOutput);
+        }
+        if (interruption === "none") {
+          for (const changedScope of [
+            { allowedTools: ["read", "browser"] },
+            {
+              policy: {
+                ...poll.policy,
+                sessionPolicy: persistent ? "ephemeral" : "persistent",
+              },
+            },
+            { identity: { ...poll.identity, topicId: "another-topic" } },
+          ]) {
+            const rejected = await executeHermesBridgeTask({
+              config,
+              request: request({ ...poll, ...changedScope, idempotencyKey: "wrong-scope" }),
+              subagent,
+              cleanupStore: store,
+            });
+            expect(rejected).toMatchObject({
+              status: "failed",
+              error: { message: expect.stringContaining("another execution scope") },
+            });
+          }
+        }
+        expect(subagent.getSessionMessages).toHaveBeenCalledTimes(
+          interruption === "before-cleanup" ? 2 : 1,
+        );
+        expect(subagent.deleteSession).toHaveBeenCalledTimes(
+          (interruption === "after-cleanup" && !persistent) || cancelCleanupInterrupted ? 2 : 1,
+        );
+        expect(subagent.run).not.toHaveBeenCalled();
+      } finally {
+        store.close();
+      }
+    },
+  );
+
+  it("retries cancel after an ephemeral poll skipped foreign-owned cleanup", async () => {
+    const start = readonlyMarketplaceLoopRequest();
+    const identityHash = createHash("sha256")
+      .update(
+        [
+          start.identity.delegationId,
+          start.identity.attemptId,
+          start.identity.contractFingerprint,
+          start.idempotencyKey,
+        ].join("\0"),
+      )
+      .digest("hex")
+      .slice(0, 24);
+    const sessionKey = `agent:missioncrew-executor:subagent:hermes-loop-${identityHash}`;
+    const submitted = {
+      status: "succeeded",
+      summary: "Read-only observation finished",
+      acceptanceEvidence: { checked: true },
+      externalEffects: [],
+    };
+    const receipt = await createResultTool(sessionKey).execute("call", { result: submitted });
+    const subagent = successfulReadonlySubagent([
+      { role: "toolResult", toolName: RESULT_TOOL, ...receipt },
+    ]);
+    const foreignOwner = new Error(
+      `Cannot delete session ${sessionKey} because it did not create it`,
+    );
+    subagent.deleteSession
+      .mockImplementation(async () => {
+        subagent.getSessionMessages.mockResolvedValue({ messages: [] });
+      })
+      .mockRejectedValueOnce(foreignOwner)
+      .mockRejectedValueOnce(foreignOwner);
+    const config = resolveHermesBridgeConfig({
+      enabled: true,
+      mode: "live",
+      hermesMode: "real",
+      allowedTasks: ["openclaw.agent.loop_contract_poll", "openclaw.agent.loop_contract_cancel"],
+      allowedTools: start.allowedTools,
+    });
+    const poll = request({
+      ...start,
+      taskId: "openclaw.agent.loop_contract_poll",
+      idempotencyKey: "skipped-cleanup:poll",
+      input: {
+        ...start.input,
+        startIdempotencyKey: start.idempotencyKey,
+        backendRunId: "skipped-cleanup-run",
+        backendSessionKey: sessionKey,
+      },
+    });
+    const cancel = request({
+      ...poll,
+      taskId: "openclaw.agent.loop_contract_cancel",
+      idempotencyKey: "skipped-cleanup:cancel",
+    });
+    const dbPath = resolve(mkdtempSync(resolve(tmpdir(), "hermes-loop-cancel-")), "state.sqlite");
+    let store = new SqliteHermesBridgeIdempotencyStore(dbPath);
+    const invoke = (input: typeof poll) =>
+      executeHermesBridgeTask({ config, request: input, subagent, cleanupStore: store });
+    try {
+      const first = await invoke(poll);
+      expect(first).toMatchObject({
+        status: "succeeded",
+        output: {
+          result: submitted,
+          evidence: { terminal: true, sessionCleaned: false, cleanupWarning: expect.any(String) },
+        },
+      });
+      expect(await invoke(cancel)).toMatchObject({
+        status: "running",
+        error: { type: "cleanup_in_progress" },
+      });
+      expect(subagent.deleteSession).toHaveBeenCalledTimes(2);
+      store.close();
+      store = new SqliteHermesBridgeIdempotencyStore(dbPath);
+      expect(await sweepHermesBridgeCleanupObligations({ store, subagent, config })).toBe(1);
+      const recovered = await invoke(request({ ...cancel, idempotencyKey: "recovered-cancel" }));
+      expect(recovered).toMatchObject({
+        status: "succeeded",
+        output: {
+          result: submitted,
+          evidence: { terminal: true, sessionCleaned: true, transcriptMessageCount: 1 },
+        },
+      });
+      expect(recovered.output).not.toHaveProperty("evidence.cleanupWarning");
+      const repolled = await invoke(request({ ...poll, idempotencyKey: "replayed-poll" }));
+      expect(repolled.output).toEqual(first.output);
+      expect(subagent.deleteSession).toHaveBeenCalledTimes(3);
+      expect(subagent.getSessionMessages).toHaveBeenCalledTimes(1);
+      expect(subagent.run).not.toHaveBeenCalled();
+    } finally {
+      store.close();
+    }
+  });
+
   it.each(["ok", "error", "succeeded", "failed", "timed_out", "cancelled", "lost", "missing_end"])(
     "handles yielded detached image work: %s",
     async (scenario) => {
@@ -440,7 +769,14 @@ describe("executeHermesBridgeTask", () => {
           backendSessionKey: sessionKey,
         },
       });
-      const invoke = () => executeHermesBridgeTask({ config, request: poll, subagent, taskRuns });
+      const invoke = () =>
+        executeHermesBridgeTask({
+          cleanupStore: loopCleanupStore,
+          config,
+          request: poll,
+          subagent,
+          taskRuns,
+        });
       if (waitStatus === "error") {
         expect(await invoke()).toMatchObject({ status: "blocked" });
         expect(subagent.deleteSession).toHaveBeenCalledExactlyOnceWith({ sessionKey });
@@ -498,6 +834,7 @@ describe("executeHermesBridgeTask", () => {
     },
   );
   beforeEach(() => {
+    loopCleanupStore = new MemoryHermesBridgeIdempotencyStore();
     dispatchGatewayMethod.mockReset();
   });
   it("admits named Marketplace read-only scope with zero external-effect budget", async () => {
@@ -510,6 +847,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -556,6 +894,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -623,6 +962,7 @@ describe("executeHermesBridgeTask", () => {
       } satisfies PluginRuntime["subagent"];
 
       const result = await executeHermesBridgeTask({
+        cleanupStore: loopCleanupStore,
         config: resolveHermesBridgeConfig({
           enabled: true,
           mode: "live",
@@ -684,7 +1024,12 @@ describe("executeHermesBridgeTask", () => {
       allowedTools: scoped.allowedTools,
     });
     try {
-      const result = await executeHermesBridgeTask({ config, request: scoped, subagent });
+      const result = await executeHermesBridgeTask({
+        cleanupStore: loopCleanupStore,
+        config,
+        request: scoped,
+        subagent,
+      });
       expect(result, JSON.stringify(result)).toMatchObject({ ok: true, status: "accepted" });
       expect(subagent.run).toHaveBeenCalledOnce();
     } finally {
@@ -733,6 +1078,7 @@ describe("executeHermesBridgeTask", () => {
       deleteSession: vi.fn(),
     } satisfies PluginRuntime["subagent"];
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -768,6 +1114,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -799,6 +1146,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -829,6 +1177,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -900,6 +1249,7 @@ describe("executeHermesBridgeTask", () => {
     });
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -974,6 +1324,7 @@ describe("executeHermesBridgeTask", () => {
     });
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1052,6 +1403,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1128,6 +1480,7 @@ describe("executeHermesBridgeTask", () => {
         deleteSession: vi.fn().mockResolvedValue(undefined),
       } satisfies PluginRuntime["subagent"];
       const polled = await executeHermesBridgeTask({
+        cleanupStore: loopCleanupStore,
         config: resolveHermesBridgeConfig({
           enabled: true,
           mode: "live",
@@ -1218,6 +1571,7 @@ describe("executeHermesBridgeTask", () => {
     });
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1329,6 +1683,7 @@ describe("executeHermesBridgeTask", () => {
     });
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1438,6 +1793,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
     const result = await withEnvAsync({ OPENCLAW_STATE_DIR: stateDir }, () =>
       executeHermesBridgeTask({
+        cleanupStore: loopCleanupStore,
         config: resolveHermesBridgeConfig({
           enabled: true,
           mode: "live",
@@ -1492,6 +1848,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1527,6 +1884,7 @@ describe("executeHermesBridgeTask", () => {
       } satisfies PluginRuntime["subagent"];
 
       const result = await executeHermesBridgeTask({
+        cleanupStore: loopCleanupStore,
         config: resolveHermesBridgeConfig({
           enabled: true,
           mode: "live",
@@ -1563,6 +1921,7 @@ describe("executeHermesBridgeTask", () => {
       } satisfies PluginRuntime["subagent"];
 
       const result = await executeHermesBridgeTask({
+        cleanupStore: loopCleanupStore,
         config: resolveHermesBridgeConfig({
           enabled: true,
           mode: "live",
@@ -1598,6 +1957,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1676,6 +2036,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1737,6 +2098,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1772,6 +2134,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1802,6 +2165,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
@@ -1829,6 +2193,7 @@ describe("executeHermesBridgeTask", () => {
     } satisfies PluginRuntime["subagent"];
 
     const result = await executeHermesBridgeTask({
+      cleanupStore: loopCleanupStore,
       config: resolveHermesBridgeConfig({
         enabled: true,
         mode: "live",
