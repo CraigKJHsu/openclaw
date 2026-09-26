@@ -1,6 +1,7 @@
 // Subagent announce delivery tests cover the last-mile routing used when child
 // runs report progress or completion back to the requester session.
 import { afterEach, describe, expect, it, vi } from "vitest";
+import * as configSessions from "../config/sessions.js";
 import { OutboundDeliveryError } from "../infra/outbound/deliver-types.js";
 import {
   testing as sessionBindingServiceTesting,
@@ -27,6 +28,7 @@ import {
 import { resolveAnnounceOrigin } from "./subagent-announce-origin.js";
 
 afterEach(() => {
+  vi.restoreAllMocks();
   sessionBindingServiceTesting.resetSessionBindingAdaptersForTests();
   setActivePluginRegistry(createTestRegistry());
   testing.setDepsForTest();
@@ -330,6 +332,7 @@ async function deliverTelegramDirectMessageCompletion(params: {
 
 async function deliverSlackChannelAnnouncement(params: {
   callGateway: typeof runtimeCallGateway;
+  dispatchGatewayMethodInProcess?: typeof runtimeDispatchGatewayMethodInProcess;
   isActive: boolean;
   sessionId: string;
   expectsCompletionMessage: boolean;
@@ -363,6 +366,9 @@ async function deliverSlackChannelAnnouncement(params: {
 
   testing.setDepsForTest({
     callGateway: params.callGateway,
+    ...(params.dispatchGatewayMethodInProcess
+      ? { dispatchGatewayMethodInProcess: params.dispatchGatewayMethodInProcess }
+      : {}),
     getRequesterSessionActivity: () => ({
       sessionId: params.sessionId,
       isActive: params.isActive,
@@ -1495,6 +1501,118 @@ describe("deliverSubagentAnnouncement completion delivery", () => {
       forceSyntheticClient: true,
       timeoutMs: 120_000,
     });
+    expect(mockCallArg(dispatchGatewayMethodInProcess, 0, 2)).not.toHaveProperty(
+      "allowSyntheticModelOverride",
+    );
+  });
+
+  it("continues dormant image completions with the requester's runtime model", async () => {
+    const requesterSessionKey = "agent:main:slack:channel:C123";
+    vi.spyOn(configSessions, "loadSessionStore").mockReturnValue({
+      [requesterSessionKey]: {
+        sessionId: "requester-session-image",
+        updatedAt: 1,
+        modelProvider: "openai",
+        model: "gpt-5.5",
+      },
+    });
+    const dispatchGatewayMethodInProcess = createInProcessGatewayMock({
+      result: { payloads: [{ text: "image completed" }] },
+    });
+
+    const result = await deliverSlackChannelAnnouncement({
+      callGateway: createGatewayMock(),
+      dispatchGatewayMethodInProcess,
+      sessionId: "requester-session-image",
+      isActive: false,
+      expectsCompletionMessage: true,
+      directIdempotencyKey: "announce-image-runtime-model",
+      requesterSessionKey,
+      sourceTool: "image_generate",
+      runtimeConfig: {
+        agents: { defaults: { model: { primary: "openai/gpt-5.6-terra" } } },
+      },
+    });
+
+    expectRecordFields(result, { delivered: true, path: "direct" });
+    expectInProcessAgentParams(dispatchGatewayMethodInProcess, {
+      provider: "openai",
+      model: "gpt-5.5",
+    });
+    expect(mockCallArg(dispatchGatewayMethodInProcess, 0, 2)).toMatchObject({
+      allowSyntheticModelOverride: true,
+    });
+  });
+
+  it.each(["user", "auto"] as const)(
+    "leaves %s session model overrides to the existing selection owner",
+    async (modelOverrideSource) => {
+      const requesterSessionKey = "agent:main:slack:channel:C123";
+      vi.spyOn(configSessions, "loadSessionStore").mockReturnValue({
+        [requesterSessionKey]: {
+          sessionId: "requester-session-selected",
+          updatedAt: 1,
+          modelProvider: "openai",
+          model: "gpt-5.5",
+          providerOverride: "anthropic",
+          modelOverride: "claude-opus-4-6",
+          modelOverrideSource,
+        },
+      });
+      const dispatchGatewayMethodInProcess = createInProcessGatewayMock({
+        result: { payloads: [{ text: "completion with selected model" }] },
+      });
+
+      await deliverSlackChannelAnnouncement({
+        callGateway: createGatewayMock(),
+        dispatchGatewayMethodInProcess,
+        sessionId: "requester-session-selected",
+        isActive: false,
+        expectsCompletionMessage: true,
+        directIdempotencyKey: `announce-selected-model-${modelOverrideSource}`,
+        requesterSessionKey,
+        sourceTool: "image_generate",
+      });
+
+      const agentParams = expectInProcessAgentParams(dispatchGatewayMethodInProcess, {});
+      expect(agentParams).not.toHaveProperty("provider");
+      expect(agentParams).not.toHaveProperty("model");
+      expect(mockCallArg(dispatchGatewayMethodInProcess, 0, 2)).not.toHaveProperty(
+        "allowSyntheticModelOverride",
+      );
+    },
+  );
+
+  it("does not turn runtime identity into an override for ordinary announcements", async () => {
+    const requesterSessionKey = "agent:main:slack:channel:C123";
+    vi.spyOn(configSessions, "loadSessionStore").mockReturnValue({
+      [requesterSessionKey]: {
+        sessionId: "requester-session-announce",
+        updatedAt: 1,
+        modelProvider: "openai",
+        model: "gpt-5.5",
+      },
+    });
+    const dispatchGatewayMethodInProcess = createInProcessGatewayMock({
+      result: { payloads: [{ text: "ordinary announcement" }] },
+    });
+
+    await deliverSlackChannelAnnouncement({
+      callGateway: createGatewayMock(),
+      dispatchGatewayMethodInProcess,
+      sessionId: "requester-session-announce",
+      isActive: false,
+      expectsCompletionMessage: false,
+      directIdempotencyKey: "announce-runtime-model-non-completion",
+      requesterSessionKey,
+    });
+
+    const agentParams = expectInProcessAgentParams(dispatchGatewayMethodInProcess, {});
+    expect(agentParams).not.toHaveProperty("provider");
+    expect(agentParams).not.toHaveProperty("model");
+    expect(mockCallArg(dispatchGatewayMethodInProcess, 0, 2)).not.toHaveProperty(
+      "allowSyntheticModelOverride",
+    );
   });
 
   it.each([

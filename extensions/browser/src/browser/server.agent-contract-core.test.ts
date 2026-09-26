@@ -177,6 +177,47 @@ describe("browser control server", () => {
     slowTimeoutMs,
   );
 
+  it.each(["t1", "abcd", "abcd1234"])(
+    "dispatches resolved target %s using its canonical ID",
+    async (targetId) => {
+      const base = await startServerAndBase();
+      const result = await postJson<{ ok: boolean; targetId: string }>(`${base}/act`, {
+        kind: "evaluate",
+        targetId,
+        fn: "() => document.title",
+      });
+      expect(result.ok).toBe(true);
+      expect(result.targetId).toBe("abcd1234");
+      const args = mockFirstArg(getPwMocks().executeActViaPlaywright, 0, "executeAct");
+      expect(args.targetId).toBe("abcd1234");
+      expectRecordFields(args.action, { targetId: "abcd1234" });
+    },
+    slowTimeoutMs,
+  );
+
+  it(
+    "canonicalizes matching batch aliases while rejecting other tabs",
+    async () => {
+      const base = await startServerAndBase();
+      const result = await postJson<{ ok: boolean }>(`${base}/act`, {
+        kind: "batch",
+        targetId: "t1",
+        actions: [{ kind: "batch", actions: [{ kind: "press", key: "Escape", targetId: "t1" }] }],
+      });
+      expect(result.ok).toBe(true);
+      const args = mockFirstArg(getPwMocks().executeActViaPlaywright, 0, "executeAct");
+      expect(args.action).toMatchObject({ actions: [{ actions: [{ targetId: "abcd1234" }] }] });
+      const rejected = await postActAndReadError(base, {
+        kind: "batch",
+        targetId: "t1",
+        actions: [{ kind: "press", key: "Escape", targetId: "other-tab" }],
+      });
+      expect(rejected.status).toBe(403);
+      expect(getPwMocks().executeActViaPlaywright).toHaveBeenCalledTimes(1);
+    },
+    slowTimeoutMs,
+  );
+
   it(
     "returns ACT_TARGET_ID_MISMATCH for top-level action targetId overrides",
     async () => {

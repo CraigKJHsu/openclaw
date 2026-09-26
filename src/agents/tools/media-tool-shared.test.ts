@@ -83,6 +83,66 @@ describe("resolveMediaToolLocalRoots", () => {
     expect(normalizedRoots).not.toContain(normalizeHostPath("/"));
   });
 
+  it("widens only the concrete source parent when the agent can read host files", () => {
+    const stateDir = path.join("/tmp", "openclaw-readable-media-tool-roots-state");
+    const sourceDir = path.join("/Users", "peter", ".hermes", "kanban", "artifacts", "task-1");
+    const cfg = {
+      agents: {
+        list: [
+          {
+            id: "content",
+            workspace: path.join(stateDir, "workspace-content"),
+            tools: { allow: ["read", "image_generate"] },
+          },
+        ],
+      },
+    } satisfies OpenClawConfig;
+
+    const roots = withEnv({ OPENCLAW_STATE_DIR: stateDir }, () =>
+      resolveMediaToolLocalRoots(
+        path.join(stateDir, "workspace-content"),
+        { cfg, agentId: "content" },
+        [path.join(sourceDir, "reference.png")],
+      ),
+    );
+
+    expect(roots.map(normalizeHostPath)).toContain(normalizeHostPath(sourceDir));
+    expect(roots.map(normalizeHostPath)).not.toContain(normalizeHostPath("/Users/peter/.hermes"));
+  });
+
+  it("does not widen source roots when the agent cannot read host files", () => {
+    const stateDir = path.join("/tmp", "openclaw-denied-media-tool-roots-state");
+    const sourceDir = path.join("/Users", "peter", ".hermes", "kanban", "artifacts", "task-1");
+    const cfg = {
+      agents: {
+        list: [
+          {
+            id: "content",
+            workspace: path.join(stateDir, "workspace-content"),
+            tools: { allow: ["image_generate"] },
+          },
+        ],
+      },
+    } satisfies OpenClawConfig;
+
+    const roots = withEnv({ OPENCLAW_STATE_DIR: stateDir }, () =>
+      resolveMediaToolLocalRoots(
+        path.join(stateDir, "workspace-content"),
+        { cfg, agentId: "content" },
+        [path.join(sourceDir, "reference.png")],
+      ),
+    );
+
+    expect(roots.map(normalizeHostPath)).not.toContain(normalizeHostPath(sourceDir));
+
+    const unidentifiedRoots = withEnv({ OPENCLAW_STATE_DIR: stateDir }, () =>
+      resolveMediaToolLocalRoots(path.join(stateDir, "workspace-content"), { cfg }, [
+        path.join(sourceDir, "reference.png"),
+      ]),
+    );
+    expect(unidentifiedRoots.map(normalizeHostPath)).not.toContain(normalizeHostPath(sourceDir));
+  });
+
   it("keeps channel inbound attachment roots separate from local roots", () => {
     // Inbound channel roots may include broad chat attachment folders; keep them
     // out of local filesystem allowlists unless the channel context asks.

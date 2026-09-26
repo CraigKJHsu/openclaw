@@ -173,6 +173,82 @@ describe("browser remote profile fallback and attachOnly behavior", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("uses guarded Playwright for strict attachOnly loopback tab opens", async () => {
+    const url = "https://www.facebook.com/";
+    const createPageViaPlaywright = vi.fn(async () => ({
+      targetId: "T_STRICT_LOCAL",
+      title: "Facebook",
+      url,
+      type: "page",
+    }));
+    const getPwAiModule = vi.spyOn(deps.pwAiModule, "getPwAiModule").mockResolvedValue({
+      createPageViaPlaywright,
+    } as unknown as Awaited<ReturnType<typeof deps.pwAiModule.getPwAiModule>>);
+    const createTargetViaCdp = vi.spyOn(deps.cdpModule, "createTargetViaCdp");
+    const state = deps.makeState("openclaw");
+    state.resolved.ssrfPolicy = {
+      dangerouslyAllowPrivateNetwork: false,
+      allowedHostnames: ["127.0.0.1"],
+      hostnameAllowlist: ["127.0.0.1", "facebook.com", "www.facebook.com"],
+    };
+    state.resolved.profiles.openclaw = {
+      cdpUrl: "http://127.0.0.1:9222",
+      attachOnly: true,
+      color: "#FF4500",
+    };
+    const fetchMock = vi.fn(async () => {
+      throw new Error("unexpected fetch");
+    });
+    global.fetch = withBrowserFetchPreconnect(fetchMock);
+    const ctx = deps.createBrowserRouteContext({ getState: () => state });
+
+    const opened = await ctx.forProfile("openclaw").openTab(url);
+
+    expect(opened.targetId).toBe("T_STRICT_LOCAL");
+    expect(state.profiles.get("openclaw")?.lastTargetId).toBe("T_STRICT_LOCAL");
+    expect(getPwAiModule).toHaveBeenCalledWith({ mode: "strict" });
+    expect(createPageViaPlaywright).toHaveBeenCalledWith({
+      cdpUrl: "http://127.0.0.1:9222",
+      url,
+      ssrfPolicy: state.resolved.ssrfPolicy,
+    });
+    expect(createTargetViaCdp).not.toHaveBeenCalled();
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it.each([null, {}])(
+    "fails closed for strict attachOnly loopback tab opens without a Playwright creator (%j)",
+    async (mod) => {
+      const getPwAiModule = vi
+        .spyOn(deps.pwAiModule, "getPwAiModule")
+        .mockResolvedValue(mod as Awaited<ReturnType<typeof deps.pwAiModule.getPwAiModule>>);
+      const createTargetViaCdp = vi.spyOn(deps.cdpModule, "createTargetViaCdp");
+      const state = deps.makeState("openclaw");
+      state.resolved.ssrfPolicy = {
+        dangerouslyAllowPrivateNetwork: false,
+        allowedHostnames: ["127.0.0.1"],
+        hostnameAllowlist: ["127.0.0.1", "facebook.com", "www.facebook.com"],
+      };
+      state.resolved.profiles.openclaw = {
+        cdpUrl: "http://127.0.0.1:9222",
+        attachOnly: true,
+        color: "#FF4500",
+      };
+      const fetchMock = vi.fn(async () => {
+        throw new Error("unexpected fetch");
+      });
+      global.fetch = withBrowserFetchPreconnect(fetchMock);
+      const ctx = deps.createBrowserRouteContext({ getState: () => state });
+
+      await expect(ctx.forProfile("openclaw").openTab("https://www.facebook.com/")).rejects.toThrow(
+        "Navigation blocked: strict browser SSRF policy requires Playwright-backed redirect-hop inspection",
+      );
+      expect(getPwAiModule).toHaveBeenCalledWith({ mode: "strict" });
+      expect(createTargetViaCdp).not.toHaveBeenCalled();
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
   it("does not enforce managed tab cap for remote openclaw profiles", async () => {
     const listPagesViaPlaywright = vi
       .fn()

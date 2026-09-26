@@ -307,7 +307,10 @@ export function createProfileTabOps({
       return assignTabAlias({ profileState, tab: page, label: opts?.label });
     }
 
-    if (capabilities.usesPersistentPlaywright) {
+    if (
+      capabilities.usesPersistentPlaywright ||
+      requiresInspectableBrowserNavigationRedirectsForUrl(url, state().resolved.ssrfPolicy)
+    ) {
       const mod = await getPwAiModule({ mode: "strict" });
       const createPageViaPlaywright = (mod as Partial<PwAiModule> | null)?.createPageViaPlaywright;
       if (typeof createPageViaPlaywright === "function") {

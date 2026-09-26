@@ -271,6 +271,7 @@ export function createOpenClawTools(
   const imageGenerateTool = optionalMediaTools.imageGenerate
     ? createImageGenerateTool({
         config: options?.config,
+        agentId: sessionAgentId,
         agentDir: options?.agentDir,
         authProfileStore: options?.authProfileStore,
         agentSessionKey: mediaGenerationAgentSessionKey,

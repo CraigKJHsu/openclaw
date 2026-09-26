@@ -571,6 +571,8 @@ type ImageGenerateSandboxConfig = {
 async function loadReferenceImages(params: {
   imageInputs: string[];
   maxBytes?: number;
+  config: OpenClawConfig;
+  agentId?: string;
   workspaceDir?: string;
   sandboxConfig: { root: string; bridge: SandboxFsBridge; workspaceOnly: boolean } | null;
   ssrfPolicy?: SsrFPolicy;
@@ -635,6 +637,8 @@ async function loadReferenceImages(params: {
       params.workspaceDir,
       {
         workspaceOnly: params.sandboxConfig?.workspaceOnly === true,
+        cfg: params.config,
+        agentId: params.agentId,
       },
       resolvedPath ? [resolvedPath] : undefined,
     );
@@ -1033,9 +1037,8 @@ function overlayAiDisclosure(params: {
     const boxWidth = textWidth + padX * 2;
     const boxHeight = textHeight + padY * 2;
     const margin = compact ? 8 : Math.round(scale * 8);
-    const bottomProgramStripReserve = compact ? 0 : Math.round(png.height * 0.11);
     const x = compact ? margin : Math.max(margin, png.width - boxWidth - margin);
-    const y = Math.max(margin, png.height - bottomProgramStripReserve - boxHeight - margin);
+    const y = Math.max(margin, png.height - boxHeight - margin);
     fillRect(
       png,
       { x, y, width: boxWidth, height: boxHeight },
@@ -1297,6 +1300,7 @@ async function executeImageGenerationJob(params: {
 
 export function createImageGenerateTool(options?: {
   config?: OpenClawConfig;
+  agentId?: string;
   agentDir?: string;
   authProfileStore?: AuthProfileStore;
   agentSessionKey?: string;
@@ -1446,6 +1450,8 @@ export function createImageGenerateTool(options?: {
       const loadedReferenceImages = await loadReferenceImages({
         imageInputs,
         maxBytes: configuredMediaMaxBytes,
+        config: effectiveCfg,
+        agentId: options?.agentId,
         workspaceDir: options?.workspaceDir,
         sandboxConfig,
         ssrfPolicy: remoteMediaSsrfPolicy,

@@ -1,5 +1,9 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveHermesBridgeConfig } from "./src/config.js";
+import {
+  createDeterministicImageRenderTool,
+  DETERMINISTIC_IMAGE_RENDER_TOOL,
+} from "./src/deterministic-image-render-capability.js";
 import { createFacebookPageCapabilityTools } from "./src/facebook-page-capability.js";
 import { createHermesBridgeHttpHandler } from "./src/http-route.js";
 import { SqliteHermesBridgeIdempotencyStore } from "./src/idempotency-store.js";
@@ -108,6 +112,11 @@ export default definePluginEntry({
       ],
       optional: true,
     });
+    api.registerTool(
+      (ctx) =>
+        createDeterministicImageRenderTool(ctx, resolveConfig(), api.runtime.tasks?.runs),
+      { name: DETERMINISTIC_IMAGE_RENDER_TOOL, optional: true },
+    );
     api.registerTool(
       (ctx) =>
         resolveConfig().enabled && ctx.sessionKey?.includes(":subagent:hermes-loop-")

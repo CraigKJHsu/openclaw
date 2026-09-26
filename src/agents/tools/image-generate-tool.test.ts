@@ -957,6 +957,27 @@ describe("createImageGenerateTool", () => {
     expect(text).toContain("dimensions=1024x1024");
     expect(details.aiDisclosureOverlayApplied).toBe(true);
     expect(savedBuffers[0].equals(sourceBuffer)).toBe(false);
+    const saved = PNG.sync.read(savedBuffers[0]);
+    const changed = (x: number, y: number) => {
+      const index = (saved.width * y + x) << 2;
+      return (
+        saved.data[index] !== 240 || saved.data[index + 1] !== 240 || saved.data[index + 2] !== 240
+      );
+    };
+    expect(
+      [...Array(80).keys()].some((dy) =>
+        [...Array(300).keys()].some((dx) =>
+          changed(saved.width - 300 + dx, saved.height - 80 + dy),
+        ),
+      ),
+    ).toBe(true);
+    expect(
+      [...Array(80).keys()].some((dy) =>
+        [...Array(300).keys()].some((dx) =>
+          changed(saved.width - 300 + dx, saved.height - 180 + dy),
+        ),
+      ),
+    ).toBe(false);
   });
 
   it("applies AI disclosure overlay for AI BizWeek Audio Brief assets even without exact disclosure wording", async () => {

@@ -35,6 +35,14 @@ describe("structured result receipt", () => {
       ).toBeUndefined();
     },
   );
+  it("rejects unsolicited memory promotion before issuing a zero-effect receipt", async () => {
+    await expect(createResultTool(session).execute("call", { result: {
+      ...result, status: "succeeded",
+      domainMemoryDeltas: [{ namespace: "research", type: "note", promote_after_grace_acceptance: true, content: "research note" }],
+    } })).rejects.toThrow("domainMemoryDeltas");
+    const receipt = await createResultTool(session).execute("corrected", { result });
+    expect(JSON.parse(submittedResultText([{ role: "toolResult", toolName: RESULT_TOOL, ...receipt }], session)!)).toEqual(result);
+  });
   it("returns a tool validation error for misplaced required fields", async () => {
     await expect(
       createResultTool(session).execute("call", {

@@ -4,7 +4,10 @@
  * Routes completion payloads through gateway/channel/session paths and records delivery evidence.
  */
 import { clampTimerTimeoutMs } from "@openclaw/normalization-core/number-coercion";
-import { normalizeOptionalLowercaseString } from "@openclaw/normalization-core/string-coerce";
+import {
+  normalizeOptionalLowercaseString,
+  normalizeOptionalString,
+} from "@openclaw/normalization-core/string-coerce";
 import {
   normalizeStringEntries,
   uniqueStrings,
@@ -49,6 +52,7 @@ import type { EmbeddedAgentQueueMessageOptions } from "./embedded-agent-runner/r
 import type { EmbeddedAgentQueueMessageOutcome } from "./embedded-agent-runner/runs.js";
 import { mediaUrlsFromGeneratedAttachments } from "./generated-attachments.js";
 import type { AgentInternalEvent } from "./internal-events.js";
+import { resolvePersistedSelectedModelRef } from "./model-selection.js";
 import { isSessionWriteLockAcquireError } from "./session-write-lock-error.js";
 import {
   callGateway,
@@ -133,6 +137,10 @@ async function runAnnounceAgentCall(params: {
   expectFinal?: boolean;
   timeoutMs?: number;
 }): Promise<unknown> {
+  const hasModelOverride = Boolean(
+    normalizeOptionalString(params.agentParams.provider) &&
+    normalizeOptionalString(params.agentParams.model),
+  );
   return await subagentAnnounceDeliveryDeps.dispatchGatewayMethodInProcess(
     "agent",
     params.agentParams,
@@ -141,6 +149,7 @@ async function runAnnounceAgentCall(params: {
       forceSyntheticClient: shouldPreserveUserFacingSessionStateForInputProvenance(
         params.agentParams.inputProvenance,
       ),
+      ...(hasModelOverride ? { allowSyntheticModelOverride: true } : {}),
       timeoutMs: params.timeoutMs,
     },
   );
@@ -1293,6 +1302,23 @@ async function sendSubagentAnnounceDirectly(params: {
       ? effectiveDirectOrigin
       : requesterSessionOrigin;
     const requesterEntry = loadRequesterSessionEntry(params.targetRequesterSessionKey).entry;
+    const hasSessionModelOverride = Boolean(
+      normalizeOptionalString(requesterEntry?.providerOverride) ||
+      normalizeOptionalString(requesterEntry?.modelOverride),
+    );
+    const runtimeProvider = normalizeOptionalString(requesterEntry?.modelProvider);
+    const runtimeModel = normalizeOptionalString(requesterEntry?.model);
+    // Dormant completions continue the requester's last runtime identity. Explicit
+    // session overrides stay with agent-command so user and auto selection semantics survive.
+    const completionModelRef =
+      params.expectsCompletionMessage && !hasSessionModelOverride && runtimeProvider && runtimeModel
+        ? resolvePersistedSelectedModelRef({
+            runtimeProvider,
+            runtimeModel,
+            allowManifestNormalization: false,
+            allowPluginNormalization: false,
+          })
+        : null;
     const deliveryTarget = !params.requesterIsSubagent
       ? resolveExternalBestEffortDeliveryTarget({
           channel: effectiveDirectOrigin?.channel,
@@ -1490,6 +1516,9 @@ async function sendSubagentAnnounceDirectly(params: {
       },
       ...(completionSourceReplyDeliveryMode
         ? { sourceReplyDeliveryMode: completionSourceReplyDeliveryMode }
+        : {}),
+      ...(completionModelRef
+        ? { provider: completionModelRef.provider, model: completionModelRef.model }
         : {}),
       idempotencyKey: params.directIdempotencyKey,
     };

@@ -317,6 +317,7 @@ describe("createOpenClawTools media generation session wiring", () => {
 
     expect(mocks.createImageGenerateToolOptions).toHaveBeenCalledWith(
       expect.objectContaining({
+        agentId: "main",
         agentSessionKey: "agent:main:cron:daily-media:run:run-123",
         onAsyncTaskStarted: undefined,
       }),
