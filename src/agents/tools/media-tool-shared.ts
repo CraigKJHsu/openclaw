@@ -20,6 +20,7 @@ import type { SsrFPolicy } from "../../infra/net/ssrf.js";
 import type { Model } from "../../llm/types.js";
 import { resolveChannelInboundAttachmentRootsForChannel } from "../../media/channel-inbound-roots.js";
 import { getDefaultLocalRoots } from "../../media/local-media-access.js";
+import { getAgentScopedMediaLocalRootsForSources } from "../../media/local-roots.js";
 import { readSnakeCaseParamRaw } from "../../param-key.js";
 import { loadCapabilityManifestSnapshot } from "../../plugins/capability-provider-runtime.js";
 import { listAvailableManifestContractValues } from "../../plugins/manifest-contract-eligibility.js";
@@ -574,10 +575,11 @@ export function resolveMediaToolLocalRoots(
   options?: {
     workspaceOnly?: boolean;
     cfg?: OpenClawConfig;
+    agentId?: string;
     channelId?: string | null;
     accountId?: string | null;
   },
-  _mediaSources?: readonly string[],
+  mediaSources?: readonly string[],
 ): string[] {
   const workspaceDir = normalizeWorkspaceDir(workspaceDirRaw);
   if (options?.workspaceOnly) {
@@ -585,7 +587,14 @@ export function resolveMediaToolLocalRoots(
   }
   // Channel inbound attachment roots stay separate: those paths are scoped to inbound media
   // access, not broad host-local file reads.
-  const roots = getDefaultLocalRoots();
+  const roots =
+    options?.cfg && options.agentId
+      ? getAgentScopedMediaLocalRootsForSources({
+          cfg: options.cfg,
+          agentId: options.agentId,
+          mediaSources,
+        })
+      : getDefaultLocalRoots();
   return uniqueStrings([...roots, ...(workspaceDir ? [workspaceDir] : [])]);
 }
 

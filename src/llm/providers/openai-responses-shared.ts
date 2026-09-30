@@ -632,6 +632,9 @@ export async function processResponsesStream<TApi extends Api>(
   for await (const event of openaiStream) {
     if (event.type === "response.created") {
       output.responseId = event.response.id;
+      if (typeof event.response.model === "string" && event.response.model) {
+        output.responseModel = event.response.model;
+      }
     } else if (event.type === "response.output_item.added") {
       const item = event.item;
       if (item.type !== "message") {
@@ -928,6 +931,9 @@ export async function processResponsesStream<TApi extends Api>(
       const response = event.response;
       if (response?.id) {
         output.responseId = response.id;
+      }
+      if (typeof response?.model === "string" && response.model) {
+        output.responseModel = response.model;
       }
       if (response?.usage) {
         const cachedTokens = response.usage.input_tokens_details?.cached_tokens || 0;

@@ -624,6 +624,38 @@ describe("convertResponsesMessages", () => {
 });
 
 describe("processResponsesStream", () => {
+  it("keeps the provider response model separate from the requested model", async () => {
+    const output = createAssistantOutput();
+    const stream = new AssistantMessageEventStream();
+    await processResponsesStream(
+      responseEvents([
+        {
+          type: "response.completed",
+          response: { id: "resp_1", model: "gpt-6-sol", status: "completed" },
+        },
+      ]),
+      output,
+      stream,
+      nativeOpenAIModel,
+    );
+    expect(output.model).toBe("gpt-5.5");
+    expect(output.responseModel).toBe("gpt-6-sol");
+  });
+
+  it("captures the provider model from response.created when completion omits it", async () => {
+    const output = createAssistantOutput();
+    await processResponsesStream(
+      responseEvents([
+        { type: "response.created", response: { id: "resp_2", model: "gpt-6-astra" } },
+        { type: "response.completed", response: { id: "resp_2", status: "completed" } },
+      ]),
+      output,
+      new AssistantMessageEventStream(),
+      nativeOpenAIModel,
+    );
+    expect(output.responseModel).toBe("gpt-6-astra");
+  });
+
   it.each([
     ["omits arguments", undefined],
     ["sends empty arguments", ""],

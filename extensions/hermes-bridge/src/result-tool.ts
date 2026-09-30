@@ -43,6 +43,11 @@ export function createResultTool(sessionKey: string) {
           "Result requires status, summary, acceptanceEvidence and externalEffects at the top level",
         );
       }
+      // Zero-effect work cannot support canonical domain-memory mutations.
+      // Fail here so the worker can correct its result before terminal polling.
+      if (Array.isArray(result.domainMemoryDeltas) && result.domainMemoryDeltas.length > 0 && result.externalEffects.length === 0) {
+        throw new Error("Zero-effect result must omit domainMemoryDeltas or return an empty array; put research notes in acceptanceEvidence. No memory promotion is authorized by this receipt.");
+      }
       return jsonResult({ kind: "missioncrew_result_receipt", sessionKey, result });
     },
   };

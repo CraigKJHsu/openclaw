@@ -441,13 +441,18 @@ export function registerBrowserAgentActRoutes(
               ...extra,
             });
           };
-          if (action.targetId && action.targetId !== tab.targetId) {
+          if (action.targetId && action.targetId !== tab.targetId && action.targetId !== targetId) {
             return jsonActError(
               res,
               403,
               ACT_ERROR_CODES.targetIdMismatch,
               "action targetId must match request targetId",
             );
+          }
+          // Route selection already resolved the request alias/prefix. Dispatch only
+          // the selected canonical target, never the unresolved action selector.
+          if (action.targetId) {
+            action.targetId = tab.targetId;
           }
           const profileName = profileCtx.profile.name;
           if (isExistingSession) {
@@ -662,7 +667,7 @@ export function registerBrowserAgentActRoutes(
             return;
           }
           if (action.kind === "batch") {
-            const targetIdError = validateBatchTargetIds(action.actions, tab.targetId);
+            const targetIdError = validateBatchTargetIds(action.actions, tab.targetId, targetId);
             if (targetIdError) {
               return jsonActError(res, 403, ACT_ERROR_CODES.targetIdMismatch, targetIdError);
             }
