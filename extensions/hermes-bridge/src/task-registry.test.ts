@@ -1,5 +1,28 @@
 import { describe, expect, it } from "vitest";
-import { auditLoopContractResult, sanitizeLoopContractForPrompt } from "./task-registry.js";
+import { auditLoopContractResult, sanitizeLoopContractForPrompt, stringifyLoopContractForPrompt, tokenUsageFromMessages, tokenUsageFromUnknown } from "./task-registry.js";
+
+describe("tokenUsageFromUnknown", () => {
+  it("preserves the model and provider from an actual assistant transcript message", () => {
+    expect(tokenUsageFromUnknown({
+      model: "gpt-5.5",
+      provider: "openai",
+      usage: { input: 12, output: 4 },
+    }, "openclaw-transcript")).toMatchObject({
+      model: "gpt-5.5",
+      provider: "openai",
+      inputTokens: 12,
+      outputTokens: 4,
+      source: "openclaw-transcript",
+    });
+  });
+
+  it("ignores model claims on user or tool messages", () => {
+    expect(tokenUsageFromMessages([
+      { role: "assistant", model: "gpt-5.5", usage: { input: 12, output: 4 } },
+      { role: "user", model: "spoofed", usage: { input: 99, output: 1 } },
+    ])).toMatchObject({ model: "gpt-5.5", source: "openclaw-transcript" });
+  });
+});
 import type { HermesBridgeRequest } from "./types.js";
 
 function request(): HermesBridgeRequest {
@@ -839,5 +862,23 @@ it("preserves the exact publication contract and safe approval receipt for the w
     source: "one_time_authenticated_owner_challenge",
     contract_fingerprint: "fp",
     scope_binding: "exact_loop_contract_fingerprint",
+  });
+});
+
+
+describe("read-only contract JSON image isolation", () => {
+  it("round-trips every path form without exposing native image tokens", () => {
+    const contract = {
+      paths: ["/home/alice/old.png", "/private/var/tmp/old image.png",
+        "./old.png", "../old.jpg", "~/old.webp", "file:///tmp/old.png",
+        "C:\\archive\\old.png", "[Image: source: /tmp/old image.png]",
+        "[media attached: media://inbound/old-id]"],
+      ratio: 1.25, text: '繁體中文 "quote" \\ literal',
+    };
+    const encoded = stringifyLoopContractForPrompt(contract, true);
+    expect(JSON.parse(encoded)).toEqual(contract);
+    expect(encoded).not.toContain(".png");
+    expect(encoded).not.toContain("media://");
+    expect(stringifyLoopContractForPrompt(contract, false)).toBe(JSON.stringify(contract));
   });
 });

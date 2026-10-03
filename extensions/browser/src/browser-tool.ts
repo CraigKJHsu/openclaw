@@ -6,6 +6,7 @@
  */
 import crypto from "node:crypto";
 import {
+  browserImageArtifactReceipt,
   executeActAction,
   executeConsoleAction,
   executeSnapshotAction,
@@ -828,6 +829,8 @@ export function createBrowserTool(opts?: {
               });
           touchTrackedTab(readStringValue(result.targetId) ?? targetId);
           const screenshotPath = result.path;
+          // Model-visible receipts let reviewers read the saved artifact; no media directive.
+          const artifactReceipt = browserImageArtifactReceipt(screenshotPath);
           const screenshotCfg = browserToolDeps.getRuntimeConfig();
           const imageSanitization = resolveRuntimeImageSanitization();
           try {
@@ -863,7 +866,7 @@ export function createBrowserTool(opts?: {
                   includeWarning: true,
                 },
               );
-              const text = `${headerLines.join("\n")}\n${wrappedDescription}`;
+              const text = `${artifactReceipt}\n${headerLines.join("\n")}\n${wrappedDescription}`;
               return {
                 content: [{ type: "text", text }],
                 details: {
@@ -887,7 +890,7 @@ export function createBrowserTool(opts?: {
             // input too, so defang line-start final-reply media directives.
             const rawReason = err instanceof Error ? err.message : String(err);
             const reason = neutralizeMediaDirectives(rawReason);
-            const extraText = `[browser screenshot vision failed: ${reason}]`;
+            const extraText = `${artifactReceipt}\n[browser screenshot vision failed: ${reason}]`;
             return await browserToolDeps.imageResultFromFile({
               label: "browser:screenshot",
               path: screenshotPath,
@@ -899,6 +902,7 @@ export function createBrowserTool(opts?: {
           return await browserToolDeps.imageResultFromFile({
             label: "browser:screenshot",
             path: screenshotPath,
+            extraText: artifactReceipt,
             details: result,
             imageSanitization,
           });

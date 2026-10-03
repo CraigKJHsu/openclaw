@@ -183,11 +183,19 @@ function invokeBroker(params: {
     });
     let stdout = "";
     let stderr = "";
+    let timedOut = false;
+    let outputLimitExceeded = false;
     const maxBytes = params.config.maxRequestBytes;
-    const timer = setTimeout(() => child.kill("SIGTERM"), 65_000);
+    // The read-only Graph GET may use its full 60-second transport timeout.
+    const timeoutMs = params.operation === "status" ? 90_000 : 65_000;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+    }, timeoutMs);
     child.stdout.on("data", (chunk) => {
       stdout += chunk.toString("utf8");
       if (Buffer.byteLength(stdout, "utf8") > maxBytes) {
+        outputLimitExceeded = true;
         child.kill("SIGTERM");
       }
     });
@@ -198,10 +206,17 @@ function invokeBroker(params: {
       clearTimeout(timer);
       reject(error);
     });
-    child.on("close", (code) => {
+    child.on("close", (code, signal) => {
       clearTimeout(timer);
       if (code !== 0) {
-        reject(new Error(`Facebook Page capability broker exited ${code}: ${stderr.trim()}`));
+        const reason = timedOut
+          ? `timed out after ${timeoutMs / 1000}s`
+          : outputLimitExceeded
+            ? "exceeded output limit"
+            : signal
+              ? `terminated by ${signal}`
+              : `exited ${code}`;
+        reject(new Error(`Facebook Page capability broker ${reason}: ${stderr.trim()}`));
         return;
       }
       try {
