@@ -220,6 +220,7 @@ describe("createGatewaySubagentRuntime.run subagent_ended tracking (#59164)", ()
 
     await expect(runtime.waitForRun({ runId: "plugin-run-completed" })).resolves.toEqual({
       status: "ok",
+      terminal: true,
     });
   });
 
@@ -242,6 +243,55 @@ describe("createGatewaySubagentRuntime.run subagent_ended tracking (#59164)", ()
 
     await expect(runtime.waitForRun({ runId: "plugin-run-error-completed" })).resolves.toEqual({
       status: "ok",
+      terminal: true,
     });
+  });
+
+  test("distinguishes a wait timeout from a terminal timed-out run", async () => {
+    const serverPlugins = await loadServerPlugins();
+    const runtime = serverPlugins.createGatewaySubagentRuntime();
+    serverPlugins.setFallbackGatewayContext(
+      createTestContext("plugin-wait-timeout", createTestCfg()),
+    );
+    let terminal = false;
+    handleGatewayRequest.mockImplementation(async (opts: HandleGatewayRequestOptions) => {
+      if (opts.req.method === "agent.wait") {
+        opts.respond(
+          true,
+          terminal ? { status: "timeout", endedAt: 2_000 } : { status: "timeout" },
+        );
+        return;
+      }
+      opts.respond(true, {});
+    });
+
+    await expect(runtime.waitForRun({ runId: "plugin-run-timeout" })).resolves.toEqual({
+      status: "timeout",
+      terminal: false,
+    });
+    terminal = true;
+    await expect(runtime.waitForRun({ runId: "plugin-run-timeout" })).resolves.toEqual({
+      status: "timeout",
+      terminal: true,
+    });
+  });
+
+  test("rejects an unknown wait status instead of treating it as terminal", async () => {
+    const serverPlugins = await loadServerPlugins();
+    const runtime = serverPlugins.createGatewaySubagentRuntime();
+    serverPlugins.setFallbackGatewayContext(
+      createTestContext("plugin-wait-unknown", createTestCfg()),
+    );
+    handleGatewayRequest.mockImplementation(async (opts: HandleGatewayRequestOptions) => {
+      if (opts.req.method === "agent.wait") {
+        opts.respond(true, { status: "mystery", endedAt: 2_000 });
+        return;
+      }
+      opts.respond(true, {});
+    });
+
+    await expect(runtime.waitForRun({ runId: "plugin-run-unknown" })).rejects.toThrow(
+      "unexpected status",
+    );
   });
 });

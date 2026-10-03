@@ -43,6 +43,14 @@ const browserToolActionDeps = {
 
 const BROWSER_ACT_REQUEST_TIMEOUT_SLACK_MS = 5_000;
 
+export function browserImageArtifactReceipt(path: string): string {
+  const json = JSON.stringify({ path }).replace(
+    /[\u0085\u2028\u2029]/g,
+    (character) => `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`,
+  );
+  return `[browser image artifact] ${json}`;
+}
+
 type BrowserActRequest = Parameters<typeof browserAct>[1];
 type BrowserActRequestWithTimeout = BrowserActRequest & { timeoutMs?: number };
 
@@ -503,7 +511,7 @@ export async function executeSnapshotAction(params: {
       return await browserToolActionDeps.imageResultFromFile({
         label: "browser:snapshot",
         path: snapshot.imagePath,
-        extraText: wrappedSnapshot,
+        extraText: `${browserImageArtifactReceipt(snapshot.imagePath)}\n${wrappedSnapshot}`,
         details: safeDetails,
         imageSanitization: resolveRuntimeImageSanitization(),
       });

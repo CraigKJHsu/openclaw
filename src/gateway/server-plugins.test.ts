@@ -1034,6 +1034,24 @@ describe("loadGatewayPlugins", () => {
     expect(params.idempotencyKey).toBe("caller-provided-key");
   });
 
+  test("forwards an explicit empty per-run tool allowlist", async () => {
+    const serverPlugins = serverPluginsModule;
+    const runtime = await createSubagentRuntime(serverPlugins);
+    serverPlugins.setFallbackGatewayContext(createTestContext("tools-allow-forward"));
+
+    await runtime.run({
+      sessionKey: "s-tools-allow-forward",
+      message: "review without tools",
+      deliver: false,
+      toolsAllow: [],
+      disableTools: true,
+    });
+
+    const params = getRequiredLastDispatchedParams();
+    expect(params.toolsAllow).toEqual([]);
+    expect(params.disableTools).toBe(true);
+  });
+
   test("forwards lightContext as lightweight bootstrap context on subagent run", async () => {
     const serverPlugins = serverPluginsModule;
     const runtime = await createSubagentRuntime(serverPlugins);

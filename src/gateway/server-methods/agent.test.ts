@@ -650,6 +650,27 @@ describe("gateway agent handler", () => {
     });
   });
 
+  it("forwards an explicit empty per-run tool allowlist to agent execution", async () => {
+    primeMainAgentRun();
+    const respond = vi.fn();
+
+    await invokeAgent(
+      {
+        message: "review without tools",
+        agentId: "main",
+        sessionKey: "agent:main:main",
+        idempotencyKey: "idem-tools-allow-empty",
+        toolsAllow: [],
+        disableTools: true,
+      },
+      { respond, reqId: "idem-tools-allow-empty" },
+    );
+
+    const call = await waitForAgentCommandCall();
+    expect(call.toolsAllow).toEqual([]);
+    expect(call.disableTools).toBe(true);
+  });
+
   it("uses single-entry persistence for ordinary gateway admission touches", async () => {
     mockMainSessionEntry({});
     let capturedOptions:

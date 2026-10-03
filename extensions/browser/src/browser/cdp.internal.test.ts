@@ -30,16 +30,6 @@ function sendCdpResult(socket: WebSocket, id: number | undefined, result: Record
   socket.send(JSON.stringify({ id, result }));
 }
 
-function countMatching<T>(items: readonly T[], predicate: (item: T) => boolean): number {
-  let count = 0;
-  for (const item of items) {
-    if (predicate(item)) {
-      count += 1;
-    }
-  }
-  return count;
-}
-
 function replyToPageEnable(msg: CdpMockMessage, socket: WebSocket): boolean {
   if (msg.method !== "Page.enable") {
     return false;
@@ -166,109 +156,28 @@ describe("cdp internal", () => {
       expect(observed[0]?.quality).toBe(100);
     });
 
-    it("captures fullPage and restores viewport overrides", async () => {
+    it("captures fullPage content bounds without changing viewport state", async () => {
       const events: string[] = [];
       const server = await startMockWsServer((msg, socket) => {
         events.push(msg.method ?? "");
-        if (msg.method === "Page.enable") {
-          socket.send(JSON.stringify({ id: msg.id, result: {} }));
-          return;
-        }
+        if (replyToPageEnable(msg, socket)) return;
         if (msg.method === "Page.getLayoutMetrics") {
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: { cssContentSize: { width: 2000, height: 3000 } },
-            }),
-          );
+          sendCdpResult(socket, msg.id, { cssContentSize: { width: 2000, height: 3000 } });
           return;
         }
-        if (msg.method === "Runtime.evaluate") {
-          // Pre-capture viewport probe + post-capture probe.
-          const isPre = countMatching(events, (m) => m === "Runtime.evaluate") === 1;
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: {
-                result: {
-                  value: isPre
-                    ? { w: 800, h: 600, dpr: 2, sw: 1600, sh: 1200 }
-                    : { w: 2000, h: 3000, dpr: 2 },
-                },
-              },
-            }),
-          );
-          return;
+        if (msg.method === "Page.captureScreenshot") {
+          expect(msg.params?.clip).toEqual({ x: 0, y: 0, width: 2000, height: 3000, scale: 1 });
+          expect(msg.params?.captureBeyondViewport).toBe(true);
+          replyWithScreenshotData(msg, socket, "FULL");
         }
-        replyToViewportCommandOrScreenshot(msg, socket, "FULL");
       });
       wss = server.wss;
       const buf = await captureScreenshot({ wsUrl: server.wsUrl, fullPage: true });
       expect(buf.toString("utf8")).toBe("FULL");
-      expect(events).toContain("Emulation.setDeviceMetricsOverride");
-      expect(events).toContain("Emulation.clearDeviceMetricsOverride");
+      expect(events.some((method) => method.startsWith("Emulation."))).toBe(false);
     });
 
-    it("restores viewport even when the post-capture probe mismatches", async () => {
-      // Post probe returns a different dpr than saved → helper reapplies.
-      const calls: Array<Record<string, unknown>> = [];
-      let evalCount = 0;
-      const server = await startMockWsServer((msg, socket) => {
-        if (msg.method === "Page.enable") {
-          socket.send(JSON.stringify({ id: msg.id, result: {} }));
-          return;
-        }
-        if (msg.method === "Page.getLayoutMetrics") {
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: { contentSize: { width: 1200, height: 800 } },
-            }),
-          );
-          return;
-        }
-        if (msg.method === "Runtime.evaluate") {
-          evalCount += 1;
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: {
-                result: {
-                  value:
-                    evalCount === 1
-                      ? { w: 400, h: 300, dpr: 1, sw: 800, sh: 600 }
-                      : { w: 9999, h: 9999, dpr: 9 },
-                },
-              },
-            }),
-          );
-          return;
-        }
-        if (msg.method === "Emulation.setDeviceMetricsOverride") {
-          calls.push(msg.params ?? {});
-          socket.send(JSON.stringify({ id: msg.id, result: {} }));
-          return;
-        }
-        if (msg.method === "Emulation.clearDeviceMetricsOverride") {
-          socket.send(JSON.stringify({ id: msg.id, result: {} }));
-          return;
-        }
-        if (msg.method === "Page.captureScreenshot") {
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: { data: Buffer.from("PIC").toString("base64") },
-            }),
-          );
-        }
-      });
-      wss = server.wss;
-      await captureScreenshot({ wsUrl: server.wsUrl, fullPage: true });
-      // Two setDeviceMetricsOverride calls: expand then restore.
-      expect(calls.length).toBeGreaterThanOrEqual(2);
-    });
-
-    it("skips viewport expansion when content size is zero", async () => {
+    it("omits clip when content size is zero", async () => {
       const server = await startMockWsServer((msg, socket) => {
         if (msg.method === "Page.enable") {
           socket.send(JSON.stringify({ id: msg.id, result: {} }));
@@ -694,9 +603,8 @@ describe("cdp internal", () => {
       expect(observed[0]?.quality).toBe(85);
     });
 
-    it("defaults fullPage content/viewport fields to 0 when the page reports nothing", async () => {
-      // Covers the right-hand sides of `size?.width ?? 0`, `size?.height ?? 0`,
-      // `v?.w ?? 0`, `v?.h ?? 0`, `v?.dpr ?? 1`, `v?.sw ?? currentW`, `v?.sh ?? currentH`.
+    it("captures when fullPage layout metrics are absent", async () => {
+      // Missing content bounds omit clip rather than changing viewport state.
       const server = await startMockWsServer((msg, socket) => {
         if (msg.method === "Page.enable") {
           socket.send(JSON.stringify({ id: msg.id, result: {} }));
@@ -897,52 +805,24 @@ describe("cdp internal", () => {
       expect(snap.nodes).toStrictEqual([]);
     });
 
-    it("swallows a failing Emulation.clearDeviceMetricsOverride in the screenshot finally", async () => {
-      // Exercises the `.catch(() => {})` on clearDeviceMetricsOverride inside
-      // the fullPage finally block.
+    it("propagates a fullPage capture failure without changing viewport state", async () => {
+      const events: string[] = [];
       const server = await startMockWsServer((msg, socket) => {
-        if (msg.method === "Page.enable") {
-          socket.send(JSON.stringify({ id: msg.id, result: {} }));
-          return;
-        }
+        events.push(msg.method ?? "");
+        if (replyToPageEnable(msg, socket)) return;
         if (msg.method === "Page.getLayoutMetrics") {
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: { cssContentSize: { width: 800, height: 600 } },
-            }),
-          );
-          return;
-        }
-        if (msg.method === "Runtime.evaluate") {
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: { result: { value: { w: 400, h: 300, dpr: 1, sw: 800, sh: 600 } } },
-            }),
-          );
-          return;
-        }
-        if (msg.method === "Emulation.setDeviceMetricsOverride") {
-          socket.send(JSON.stringify({ id: msg.id, result: {} }));
-          return;
-        }
-        if (msg.method === "Emulation.clearDeviceMetricsOverride") {
-          socket.send(JSON.stringify({ id: msg.id, error: { message: "denied" } }));
+          sendCdpResult(socket, msg.id, { cssContentSize: { width: 800, height: 600 } });
           return;
         }
         if (msg.method === "Page.captureScreenshot") {
-          socket.send(
-            JSON.stringify({
-              id: msg.id,
-              result: { data: Buffer.from("S").toString("base64") },
-            }),
-          );
+          sendCdpResult(socket, msg.id, {});
         }
       });
       wss = server.wss;
-      const buf = await captureScreenshot({ wsUrl: server.wsUrl, fullPage: true });
-      expect(buf.toString("utf8")).toBe("S");
+      await expect(captureScreenshot({ wsUrl: server.wsUrl, fullPage: true })).rejects.toThrow(
+        "Screenshot failed: missing data",
+      );
+      expect(events.some((method) => method.startsWith("Emulation."))).toBe(false);
     });
   });
 });

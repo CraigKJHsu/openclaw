@@ -13,12 +13,14 @@ import {
   buildMediaGenerationTaskStatusText,
   findActiveMediaGenerationTaskForSession,
   findDuplicateGuardMediaGenerationTaskForSession,
+  findRecentSuccessfulMediaGenerationTaskForSession,
   listActiveMediaGenerationTasksForSession,
 } from "./media-generation-task-status-shared.js";
 
 export const IMAGE_GENERATION_TASK_KIND = "image_generation";
 const IMAGE_GENERATION_SOURCE_PREFIX = "image_generate";
 const RECENT_IMAGE_GENERATION_DUPLICATE_GUARD_MS = 2 * 60_000;
+const RECENT_IMAGE_GENERATION_STATUS_MS = 10 * 60_000;
 
 /** Finds the active image generation task for a session and optional prompt. */
 export function findActiveImageGenerationTaskForSession(
@@ -39,6 +41,18 @@ export function listActiveImageGenerationTasksForSession(sessionKey?: string): T
     sessionKey,
     taskKind: IMAGE_GENERATION_TASK_KIND,
     sourcePrefix: IMAGE_GENERATION_SOURCE_PREFIX,
+  });
+}
+
+/** Finds a recently completed image task for status recovery after missed wake events. */
+export function findRecentSuccessfulImageGenerationTaskForSession(
+  sessionKey?: string,
+): TaskRecord | undefined {
+  return findRecentSuccessfulMediaGenerationTaskForSession({
+    sessionKey,
+    taskKind: IMAGE_GENERATION_TASK_KIND,
+    sourcePrefix: IMAGE_GENERATION_SOURCE_PREFIX,
+    maxAgeMs: RECENT_IMAGE_GENERATION_STATUS_MS,
   });
 }
 

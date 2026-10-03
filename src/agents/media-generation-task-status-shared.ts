@@ -91,6 +91,22 @@ function isTaskStillBlockingDuplicateGuard(task: TaskRecord): boolean {
   return task.status === "queued" || task.status === "running";
 }
 
+function isTaskRecentSuccessfulStatus(params: {
+  task: TaskRecord;
+  maxAgeMs: number;
+  nowMs: number;
+}): boolean {
+  return (
+    params.task.status === "succeeded" &&
+    params.task.terminalOutcome !== "blocked" &&
+    isRecentMediaGenerationTaskRecord({
+      task: params.task,
+      maxAgeMs: params.maxAgeMs,
+      nowMs: params.nowMs,
+    })
+  );
+}
+
 function isTaskRecentSuccessfulDuplicate(params: {
   task: TaskRecord;
   requestKey?: string;
@@ -351,6 +367,39 @@ export function listActiveMediaGenerationTasksForSession(params: {
   ];
 }
 
+/** Finds the most recent successful media generation task for status recovery. */
+export function findRecentSuccessfulMediaGenerationTaskForSession(params: {
+  sessionKey?: string;
+  taskKind: string;
+  sourcePrefix: string;
+  maxAgeMs: number;
+  nowMs?: number;
+}): TaskRecord | undefined {
+  const sessionKey = normalizeOptionalString(params.sessionKey);
+  if (!sessionKey) {
+    return undefined;
+  }
+  const sourcePrefix = normalizeOptionalString(params.sourcePrefix);
+  const nowMs = params.nowMs ?? Date.now();
+  return listFreshTasksForOwnerKey(sessionKey).find((task) => {
+    if (
+      task.runtime !== "cli" ||
+      task.scopeKind !== "session" ||
+      task.taskKind !== params.taskKind
+    ) {
+      return false;
+    }
+    if (sourcePrefix && !mediaGenerationSourceMatches(task, sourcePrefix)) {
+      return false;
+    }
+    return isTaskRecentSuccessfulStatus({
+      task,
+      maxAgeMs: params.maxAgeMs,
+      nowMs,
+    });
+  });
+}
+
 /** Finds a task that should block duplicate media generation for a session. */
 export function findDuplicateGuardMediaGenerationTaskForSession(params: {
   sessionKey?: string;
@@ -382,6 +431,8 @@ export function buildMediaGenerationTaskStatusDetails(params: {
     ...buildSessionAsyncTaskStatusDetails(params.task),
     active: isTaskStillBlockingDuplicateGuard(params.task),
     ...(provider ? { provider } : {}),
+    ...(params.task.terminalSummary ? { terminalSummary: params.task.terminalSummary } : {}),
+    ...(params.task.endedAt ? { endedAt: params.task.endedAt } : {}),
   };
 }
 

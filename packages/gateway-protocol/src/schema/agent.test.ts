@@ -57,10 +57,47 @@ const musicCompletionEvent: AgentInternalEvent = {
 };
 
 describe("AgentParamsSchema", () => {
+  it("accepts an explicit empty per-run tool allowlist", () => {
+    expect(
+      Value.Check(AgentParamsSchema, {
+        message: "review evidence",
+        idempotencyKey: "run-without-tools",
+        toolsAllow: [],
+        disableTools: true,
+      }),
+    ).toBe(true);
+  });
+
   it("accepts generated music attachments on internal completion events", () => {
     const params = makeAgentParamsWithInternalEvent(musicCompletionEvent);
 
     expect(Value.Check(AgentParamsSchema, params)).toBe(true);
+  });
+
+  it.each([
+    [{}, true],
+    [{ width: 0 }, false],
+    [{ height: 1.5 }, false],
+    [{ dimensions: "unknown" }, false],
+    [{ sha256: "invalid" }, false],
+    [{ unexpected: true }, false],
+  ])("validates image completion metadata: %j", (override, valid) => {
+    const params = makeAgentParamsWithInternalEvent({
+      ...musicCompletionEvent,
+      source: "image_generation",
+      attachments: [{
+        type: "image",
+        path: "/tmp/openclaw/hero.png",
+        mimeType: "image/png",
+        name: "hero.png",
+        width: 1536,
+        height: 864,
+        dimensions: "1536x864",
+        sha256: "a".repeat(64),
+        ...override,
+      }],
+    });
+    expect(Value.Check(AgentParamsSchema, params)).toBe(valid);
   });
 
   it("keeps task completion internal events strict", () => {

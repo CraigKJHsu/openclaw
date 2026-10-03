@@ -1,5 +1,6 @@
 // image_generate tool tests cover provider/model selection, edit inputs,
 // background task handling, media saving, and duplicate-generation guards.
+import { createRequire } from "node:module";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 
@@ -174,6 +175,22 @@ function requireRecord(value: unknown, label: string): Record<string, unknown> {
 
 type ImageGenerateTool = NonNullable<ReturnType<typeof createImageGenerateTool>>;
 type ToolResult = Awaited<ReturnType<ImageGenerateTool["execute"]>>;
+type PngModule = {
+  PNG: {
+    new (params: { width: number; height: number }): {
+      width: number;
+      height: number;
+      data: Buffer;
+    };
+    sync: {
+      read: (buffer: Buffer) => { width: number; height: number; data: Buffer };
+      write: (image: { width: number; height: number; data: Buffer }) => Buffer;
+    };
+  };
+};
+
+const require = createRequire(import.meta.url);
+const { PNG } = require("pngjs") as PngModule;
 
 function resultDetails(result: ToolResult): Record<string, unknown> {
   return requireRecord(result.details, "tool result details");
@@ -702,6 +719,384 @@ describe("createImageGenerateTool", () => {
     expect(text).not.toMatch(/^MEDIA:/m);
   });
 
+  it("includes generated image dimensions and sha256 in attachment metadata", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "openai-key");
+    stubImageGenerationProviders();
+    const generateImage = vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue({
+      provider: "openai",
+      model: "gpt-image-1",
+      attempts: [],
+      ignoredOverrides: [],
+      images: [
+        {
+          buffer: Buffer.from("png-with-known-metadata"),
+          mimeType: "image/png",
+          fileName: "cover.png",
+        },
+      ],
+    });
+    vi.spyOn(imageOps, "getImageMetadata").mockResolvedValue({
+      width: 1600,
+      height: 2000,
+    });
+    vi.spyOn(mediaStore, "saveMediaBuffer").mockResolvedValue({
+      path: "/tmp/cover.png",
+      id: "cover.png",
+      size: 23,
+      contentType: "image/png",
+    });
+
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = await tool.execute("call-1", {
+      prompt: "Facebook Page Hero",
+      model: "openai/gpt-image-1",
+      aspectRatio: "4:5",
+    });
+
+    const text = resultText(result);
+    const details = resultDetails(result);
+    const attachments = details.attachments as Array<Record<string, unknown>>;
+    expect(text).toContain("dimensions=1600x2000");
+    expect(text).toContain(
+      "sha256=190f899e968b7fbe0e2c6806366b1b8882abf688694f3118038cc5007277c16d",
+    );
+    expect(attachments[0]).toMatchObject({
+      width: 1600,
+      height: 2000,
+      dimensions: "1600x2000",
+      sha256: "190f899e968b7fbe0e2c6806366b1b8882abf688694f3118038cc5007277c16d",
+    });
+  });
+
+  it("center-crops near-miss PNG output to the requested exact aspect ratio", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "openai-key");
+    stubImageGenerationProviders();
+    const nearMiss = new PNG({ width: 1122, height: 1402 });
+    nearMiss.data.fill(255);
+    const nearMissBuffer = PNG.sync.write(nearMiss);
+    vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue({
+      provider: "openai",
+      model: "gpt-image-1",
+      attempts: [],
+      ignoredOverrides: [],
+      images: [
+        {
+          buffer: nearMissBuffer,
+          mimeType: "image/png",
+          fileName: "page-hero.png",
+        },
+      ],
+    });
+    const savedBuffers: Buffer[] = [];
+    vi.spyOn(mediaStore, "saveMediaBuffer").mockImplementation(async (buffer) => {
+      savedBuffers.push(buffer);
+      return {
+        path: "/tmp/page-hero.png",
+        id: "page-hero.png",
+        size: buffer.length,
+        contentType: "image/png",
+      };
+    });
+
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = await tool.execute("call-1", {
+      prompt: "Facebook Page Hero",
+      model: "openai/gpt-image-1",
+      aspectRatio: "4:5",
+    });
+
+    expect(savedBuffers).toHaveLength(1);
+    const saved = PNG.sync.read(savedBuffers[0]);
+    expect(saved.width).toBe(1120);
+    expect(saved.height).toBe(1400);
+    const text = resultText(result);
+    expect(text).toContain("Normalized generated image crop to requested exact aspect ratio.");
+    expect(text).toContain("dimensions=1120x1400");
+  });
+
+  it("pads off-ratio PNG output to the requested exact aspect ratio", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "openai-key");
+    stubImageGenerationProviders();
+    const offRatio = new PNG({ width: 1003, height: 1568 });
+    offRatio.data.fill(255);
+    const offRatioBuffer = PNG.sync.write(offRatio);
+    vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue({
+      provider: "openai",
+      model: "gpt-image-1",
+      attempts: [],
+      ignoredOverrides: [],
+      images: [
+        {
+          buffer: offRatioBuffer,
+          mimeType: "image/png",
+          fileName: "page-hero.png",
+        },
+      ],
+    });
+    const savedBuffers: Buffer[] = [];
+    vi.spyOn(mediaStore, "saveMediaBuffer").mockImplementation(async (buffer) => {
+      savedBuffers.push(buffer);
+      return {
+        path: "/tmp/page-hero.png",
+        id: "page-hero.png",
+        size: buffer.length,
+        contentType: "image/png",
+      };
+    });
+
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = await tool.execute("call-1", {
+      prompt: "Facebook Page Hero",
+      model: "openai/gpt-image-1",
+      aspectRatio: "4:5",
+    });
+
+    expect(savedBuffers).toHaveLength(1);
+    const saved = PNG.sync.read(savedBuffers[0]);
+    expect(saved.width * 5).toBe(saved.height * 4);
+    expect(saved.width).toBeGreaterThanOrEqual(1003);
+    expect(saved.height).toBeGreaterThanOrEqual(1568);
+    expect(resultText(result)).toContain(
+      "Normalized generated image crop to requested exact aspect ratio.",
+    );
+  });
+
+  it("applies deterministic AI disclosure overlay for Audio Brief image assets", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "openai-key");
+    stubImageGenerationProviders();
+    const source = new PNG({ width: 1024, height: 1024 });
+    source.data.fill(240);
+    const sourceBuffer = PNG.sync.write(source);
+    vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue({
+      provider: "openai",
+      model: "gpt-image-1",
+      attempts: [],
+      ignoredOverrides: [],
+      images: [
+        {
+          buffer: sourceBuffer,
+          mimeType: "image/png",
+          fileName: "audio-brief.png",
+        },
+      ],
+    });
+    const savedBuffers: Buffer[] = [];
+    vi.spyOn(mediaStore, "saveMediaBuffer").mockImplementation(async (buffer) => {
+      savedBuffers.push(buffer);
+      return {
+        path: "/tmp/audio-brief.png",
+        id: "audio-brief.png",
+        size: buffer.length,
+        contentType: "image/png",
+      };
+    });
+
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = await tool.execute("call-1", {
+      prompt: "asset_family: audio_brief\nInclude visible AI-assisted visual disclosure.",
+      model: "openai/gpt-image-1",
+      filename: "ep04_audio_brief.png",
+      aspectRatio: "1:1",
+    });
+
+    const text = resultText(result);
+    const details = resultDetails(result);
+    expect(text).toContain("Applied deterministic AI-assisted visual disclosure overlay.");
+    expect(text).toContain("dimensions=1024x1024");
+    expect(details.aiDisclosureOverlayApplied).toBe(true);
+    expect(savedBuffers[0].equals(sourceBuffer)).toBe(false);
+  });
+
+  it("applies AI disclosure overlay for AI BizWeek Audio Brief assets even without exact disclosure wording", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "openai-key");
+    stubImageGenerationProviders();
+    const source = new PNG({ width: 1024, height: 1024 });
+    source.data.fill(245);
+    const sourceBuffer = PNG.sync.write(source);
+    vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue({
+      provider: "openai",
+      model: "gpt-image-1",
+      attempts: [],
+      ignoredOverrides: [],
+      images: [
+        {
+          buffer: sourceBuffer,
+          mimeType: "image/png",
+          fileName: "generated.png",
+        },
+      ],
+    });
+    const savedBuffers: Buffer[] = [];
+    vi.spyOn(mediaStore, "saveMediaBuffer").mockImplementation(async (buffer) => {
+      savedBuffers.push(buffer);
+      return {
+        path: "/tmp/ep04_audio_brief.png",
+        id: "ep04_audio_brief.png",
+        size: buffer.length,
+        contentType: "image/png",
+      };
+    });
+
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = await tool.execute("call-1", {
+      prompt: "AI BizWeek podcast cover\nasset_family=audio_brief",
+      model: "openai/gpt-image-1",
+      filename: "ep04_audio_brief.png",
+      aspectRatio: "1:1",
+    });
+
+    expect(resultText(result)).toContain(
+      "Applied deterministic AI-assisted visual disclosure overlay.",
+    );
+    expect(resultDetails(result).aiDisclosureOverlayApplied).toBe(true);
+    expect(savedBuffers[0].equals(sourceBuffer)).toBe(false);
+  });
+
+  it("uses a compact bottom-left disclosure for Page Hero exclusion text", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "openai-key");
+    stubImageGenerationProviders();
+    const source = new PNG({ width: 1024, height: 576 });
+    source.data.fill(245);
+    const sourceBuffer = PNG.sync.write(source);
+    const generateImage = vi.spyOn(imageGenerationRuntime, "generateImage").mockResolvedValue({
+      provider: "openai",
+      model: "gpt-image-1",
+      attempts: [],
+      ignoredOverrides: [],
+      images: [
+        {
+          buffer: sourceBuffer,
+          mimeType: "image/png",
+          fileName: "generated.png",
+        },
+      ],
+    });
+    const savedBuffers: Buffer[] = [];
+    vi.spyOn(mediaStore, "saveMediaBuffer").mockImplementation(async (buffer) => {
+      savedBuffers.push(buffer);
+      return {
+        path: "/tmp/ep04_page_hero.png",
+        id: "ep04_page_hero.png",
+        size: buffer.length,
+        contentType: "image/png",
+      };
+    });
+
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+      }),
+    );
+
+    const result = await tool.execute("call-1", {
+      prompt: "AI BizWeek asset_family=page_hero. No AUDIO BRIEF label or Audio Brief layout.",
+      model: "openai/gpt-image-1",
+      filename: "ep04_page_hero.png",
+      aspectRatio: "16:9",
+    });
+
+    expect(resultText(result)).toContain(
+      "Applied deterministic AI-assisted visual disclosure overlay.",
+    );
+    expect(resultDetails(result).aiDisclosureOverlayApplied).toBe(true);
+    expect(generateImage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        prompt: expect.not.stringMatching(/AI[-\s]*assisted\s+visual/i),
+      }),
+    );
+    expect(savedBuffers[0].equals(sourceBuffer)).toBe(false);
+    const saved = PNG.sync.read(savedBuffers[0]);
+    const darkPixel = (x: number, y: number) => {
+      const index = (saved.width * y + x) << 2;
+      return saved.data[index] < 120 && saved.data[index + 1] < 120 && saved.data[index + 2] < 120;
+    };
+    expect(
+      [...Array(40).keys()].some((dy) =>
+        [...Array(160).keys()].some((x) => darkPixel(x, saved.height - 40 + dy)),
+      ),
+    ).toBe(true);
+    expect(
+      [...Array(80).keys()].some((dy) =>
+        [...Array(400).keys()].some((dx) =>
+          darkPixel(saved.width - 400 + dx, saved.height - 80 + dy),
+        ),
+      ),
+    ).toBe(false);
+  });
+
   it("runs explicit deployment refs and preserves timeout-only image defaults", async () => {
     vi.spyOn(imageGenerationRuntime, "listRuntimeImageGenerationProviders").mockReturnValue([
       {
@@ -1070,6 +1465,60 @@ describe("createImageGenerateTool", () => {
     expect(tasks[0]?.progressSummary).toBe("Generating first image");
     expect(requireRecord(tasks[1]?.task, "second status task").taskId).toBe("task-second-image");
     expect(tasks[1]?.progressSummary).toBe("Queued second image");
+  });
+
+  it("reports a recent completed image task when status missed the wake event", async () => {
+    const endedAt = Date.now() - 15_000;
+    taskRuntimeInternalMocks.listTasksForOwnerKey.mockReturnValue([
+      {
+        taskId: "task-finished-image",
+        runtime: "cli",
+        taskKind: "image_generation",
+        sourceId: "image_generate:openai",
+        requesterSessionKey: "agent:main:discord:direct:123",
+        ownerKey: "agent:main:discord:direct:123",
+        scopeKind: "session",
+        runId: "tool:image_generate:finished",
+        task: "Finished diagram prompt",
+        status: "succeeded",
+        deliveryStatus: "not_applicable",
+        notifyPolicy: "silent",
+        createdAt: endedAt - 30_000,
+        startedAt: endedAt - 30_000,
+        endedAt,
+        lastEventAt: endedAt,
+        progressSummary: "Generated 1 image",
+        terminalSummary:
+          'Generated 1 image with openai/gpt-image-1 -> /tmp/finished.png. Attachments: 1. type=image dimensions=1120x1400 sha256=abc123 path="/tmp/finished.png"',
+      },
+    ]);
+    const tool = requireImageGenerateTool(
+      createImageGenerateTool({
+        config: {
+          agents: {
+            defaults: {
+              imageGenerationModel: {
+                primary: "openai/gpt-image-1",
+              },
+            },
+          },
+        },
+        agentSessionKey: "agent:main:discord:direct:123",
+      }),
+    );
+
+    const result = await tool.execute("call-status", { action: "status" });
+    const text = resultText(result);
+
+    expect(taskRuntimeMocks.createRunningTaskRun).not.toHaveBeenCalled();
+    expect(text).toContain("Image generation task task-finished-image recently succeeded");
+    expect(text).toContain("Use the completed output above");
+    const details = resultDetails(result);
+    expect(details.action).toBe("status");
+    expect(details.active).toBe(false);
+    expect(details.recentCompleted).toBe(true);
+    expect(details.terminalSummary).toContain("dimensions=1120x1400");
+    expect(details.terminalSummary).toContain('path="/tmp/finished.png"');
   });
 
   it("returns active status for a duplicate image request with the same prompt", async () => {

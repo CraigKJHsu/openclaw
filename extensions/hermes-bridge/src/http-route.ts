@@ -1,13 +1,24 @@
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { PluginRuntime } from "openclaw/plugin-sdk/plugin-runtime";
 import type { HermesBridgeConfig } from "./config.js";
 import { executeHermesBridgeTask } from "./executor.js";
+import {
+  hashHermesBridgeRequest,
+  MemoryHermesBridgeIdempotencyStore,
+  type HermesBridgeIdempotencyStore,
+} from "./idempotency-store.js";
 import { createHermesBridgeResult, normalizeHermesBridgeRequest } from "./schema.js";
 import type { HermesBridgeResult } from "./types.js";
 
 type HandlerParams = {
   resolveConfig: () => HermesBridgeConfig;
   env?: NodeJS.ProcessEnv | Record<string, string | undefined>;
-  idempotencyStore?: Map<string, HermesBridgeResult>;
+  idempotencyStore?: HermesBridgeIdempotencyStore;
+  resolveIdempotencyStore?: () => HermesBridgeIdempotencyStore;
+  subagent?: PluginRuntime["subagent"];
+  taskRuns?: PluginRuntime["tasks"]["runs"];
+  executeTask?: typeof executeHermesBridgeTask;
 };
 
 function getHeader(req: IncomingMessage, name: string): string | undefined {
@@ -22,6 +33,35 @@ function writeJson(res: ServerResponse, statusCode: number, payload: HermesBridg
   res.statusCode = statusCode;
   res.setHeader("content-type", "application/json; charset=utf-8");
   res.end(JSON.stringify(payload));
+}
+
+function statusCodeForResult(result: HermesBridgeResult): number {
+  if (result.ok) {
+    return 200;
+  }
+  if (result.error?.type === "cleanup_store_unavailable") {
+    return 503;
+  }
+  return result.status === "needs_confirmation" || result.status === "running" ? 409 : 404;
+}
+
+function isRetryableExecutionResult(result: HermesBridgeResult): boolean {
+  const output =
+    result.output && typeof result.output === "object" && !Array.isArray(result.output)
+      ? (result.output as Record<string, unknown>)
+      : undefined;
+  const evidence =
+    output?.evidence && typeof output.evidence === "object" && !Array.isArray(output.evidence)
+      ? (output.evidence as Record<string, unknown>)
+      : undefined;
+  return (
+    (result.status === "running" &&
+      (result.error?.type === "cleanup_in_progress" ||
+        result.error?.type === "cleanup_store_unavailable")) ||
+    (result.status === "running" &&
+      result.taskId === "openclaw.agent.zero_effect_async_start" &&
+      evidence?.admissionPending === true)
+  );
 }
 
 function errorResult(params: {
@@ -53,7 +93,15 @@ async function readBody(req: IncomingMessage, maxBytes: number): Promise<string>
 }
 
 export function createHermesBridgeHttpHandler(params: HandlerParams) {
-  const idempotencyStore = params.idempotencyStore ?? new Map<string, HermesBridgeResult>();
+  const fallbackIdempotencyStore =
+    params.idempotencyStore ?? new MemoryHermesBridgeIdempotencyStore();
+  const inFlightRequests = new Map<
+    string,
+    {
+      requestHash: string;
+      finalized: Promise<{ result: HermesBridgeResult; statusCode: number }>;
+    }
+  >();
   return async (req: IncomingMessage, res: ServerResponse): Promise<boolean> => {
     const config = params.resolveConfig();
     if (!config.enabled) {
@@ -145,20 +193,248 @@ export function createHermesBridgeHttpHandler(params: HandlerParams) {
       return true;
     }
     const request = normalized.request;
+    const requestHash = hashHermesBridgeRequest(request);
+    const claimOwnerId = request.idempotencyKey ? randomUUID() : undefined;
+    let recoveredLease = false;
+    let idempotencyStore: HermesBridgeIdempotencyStore | undefined;
     if (request.idempotencyKey) {
-      const cached = idempotencyStore.get(request.idempotencyKey);
-      if (cached) {
-        writeJson(res, cached.ok ? 200 : 409, cached);
+      try {
+        idempotencyStore =
+          params.idempotencyStore ?? params.resolveIdempotencyStore?.() ?? fallbackIdempotencyStore;
+      } catch (error) {
+        writeJson(
+          res,
+          503,
+          createHermesBridgeResult({
+            ok: false,
+            request,
+            mode: "mock",
+            status: "failed",
+            summary: "Hermes bridge idempotency store is temporarily unavailable.",
+            error: {
+              type: "idempotency_store_unavailable",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Hermes bridge idempotency store is temporarily unavailable.",
+            },
+          }),
+        );
         return true;
       }
+      let claim;
+      try {
+        claim = idempotencyStore.claim(request.idempotencyKey, requestHash, {
+          ownerId: claimOwnerId!,
+          leaseMs: Math.max(config.maxLiveRuntimeSeconds * 1_000 + 90_000, 180_000),
+        });
+      } catch (error) {
+        writeJson(
+          res,
+          503,
+          createHermesBridgeResult({
+            ok: false,
+            request,
+            mode: "mock",
+            status: "failed",
+            summary: "Hermes bridge idempotency store is temporarily unavailable.",
+            error: {
+              type: "idempotency_store_unavailable",
+              message:
+                error instanceof Error
+                  ? error.message
+                  : "Hermes bridge idempotency store is temporarily unavailable.",
+            },
+          }),
+        );
+        return true;
+      }
+      if (claim.status === "completed") {
+        writeJson(res, statusCodeForResult(claim.entry.result), claim.entry.result);
+        return true;
+      }
+      if (claim.status === "conflict") {
+        writeJson(
+          res,
+          409,
+          createHermesBridgeResult({
+            ok: false,
+            request,
+            mode: "mock",
+            status: "blocked",
+            summary: "Idempotency key was already used for a different request.",
+            error: {
+              type: "idempotency_conflict",
+              message: "Idempotency key was already used for a different request.",
+            },
+          }),
+        );
+        return true;
+      }
+      if (claim.status === "pending") {
+        const inFlight = inFlightRequests.get(request.idempotencyKey);
+        if (!inFlight || inFlight.requestHash !== requestHash) {
+          writeJson(
+            res,
+            409,
+            createHermesBridgeResult({
+              ok: false,
+              request,
+              mode: "mock",
+              status: "blocked",
+              summary: "The idempotent request is already executing in another Gateway process.",
+              error: {
+                type: "idempotency_in_progress",
+                message:
+                  "The idempotent request is already executing; retry to replay its completed result.",
+              },
+            }),
+          );
+          return true;
+        }
+        const finalized = await inFlight.finalized;
+        writeJson(res, finalized.statusCode, finalized.result);
+        return true;
+      }
+      recoveredLease = claim.recovered;
     }
 
-    const result = await executeHermesBridgeTask({ config, request });
-    if (request.idempotencyKey) {
-      idempotencyStore.set(request.idempotencyKey, result);
+    const execute = async (): Promise<HermesBridgeResult> => {
+      try {
+        return await (params.executeTask ?? executeHermesBridgeTask)({
+          config,
+          request,
+          subagent: params.subagent,
+          taskRuns: params.taskRuns,
+          recoveredLease,
+          cleanupStore: idempotencyStore,
+        });
+      } catch (error) {
+        return createHermesBridgeResult({
+          ok: false,
+          request,
+          mode: "live",
+          status: "failed",
+          summary: error instanceof Error ? error.message : "Hermes bridge execution failed.",
+          error: {
+            type: "task_execution_failed",
+            message: error instanceof Error ? error.message : "Hermes bridge execution failed.",
+          },
+        });
+      }
+    };
+    if (!request.idempotencyKey) {
+      const result = await execute();
+      writeJson(res, statusCodeForResult(result), result);
+      return true;
     }
-    const statusCode = result.ok ? 200 : result.status === "needs_confirmation" ? 409 : 404;
-    writeJson(res, statusCode, result);
-    return true;
+
+    let resolveFinalized:
+      | ((response: { result: HermesBridgeResult; statusCode: number }) => void)
+      | undefined;
+    const finalized = new Promise<{
+      result: HermesBridgeResult;
+      statusCode: number;
+    }>((resolve) => {
+      resolveFinalized = resolve;
+    });
+    inFlightRequests.set(request.idempotencyKey, {
+      requestHash,
+      finalized,
+    });
+    void (async () => {
+      const result = await execute();
+      try {
+        if (isRetryableExecutionResult(result)) {
+          idempotencyStore!.release(request.idempotencyKey!, requestHash, claimOwnerId!);
+        } else {
+          idempotencyStore!.set(request.idempotencyKey!, { requestHash, result }, claimOwnerId);
+        }
+        resolveFinalized?.({ result, statusCode: statusCodeForResult(result) });
+      } catch (error) {
+        try {
+          const input =
+            request.input && typeof request.input === "object" && !Array.isArray(request.input)
+              ? (request.input as Record<string, unknown>)
+              : {};
+          const startKey =
+            typeof input.startIdempotencyKey === "string"
+              ? input.startIdempotencyKey.trim()
+              : request.idempotencyKey!;
+          const requestedBackendRunId =
+            typeof input.backendRunId === "string" ? input.backendRunId.trim() : undefined;
+          const lifecycleFamilies: Record<string, string> = {
+            "openclaw.browser.read_snapshot_poll": "openclaw.browser.read_snapshot",
+            "openclaw.browser.read_snapshot_cancel": "openclaw.browser.read_snapshot",
+            "openclaw.agent.zero_effect_async_poll": "openclaw.agent.zero_effect_async_start",
+            "openclaw.agent.zero_effect_async_cancel": "openclaw.agent.zero_effect_async_start",
+          };
+          const lifecycleFamily = lifecycleFamilies[request.taskId];
+          const terminalStartFamily = new Set([
+            "openclaw.browser.read_snapshot",
+            "openclaw.agent.zero_effect_async_start",
+          ]).has(request.taskId)
+            ? request.taskId
+            : undefined;
+          const terminal =
+            (lifecycleFamily && requestedBackendRunId) || terminalStartFamily
+              ? idempotencyStore!.getCleanupTerminal(startKey)
+              : undefined;
+          const terminalIdentity = terminal?.request.identity;
+          const identityMatches =
+            terminalIdentity &&
+            terminalIdentity.delegationId === request.identity.delegationId &&
+            terminalIdentity.attemptId === request.identity.attemptId &&
+            terminalIdentity.contractFingerprint === request.identity.contractFingerprint &&
+            terminalIdentity.project === request.identity.project &&
+            terminalIdentity.topicId === request.identity.topicId;
+          const backendRunMatches = terminal?.backendRunId === requestedBackendRunId;
+          const lifecycleTerminalMatches =
+            lifecycleFamily &&
+            terminal?.request.taskId === lifecycleFamily &&
+            backendRunMatches &&
+            startKey !== request.idempotencyKey;
+          const startTerminalMatches =
+            terminalStartFamily &&
+            terminal?.request.taskId === terminalStartFamily &&
+            terminal.requestHash === requestHash &&
+            startKey === request.idempotencyKey;
+          if (terminal && identityMatches && (lifecycleTerminalMatches || startTerminalMatches)) {
+            idempotencyStore!.release(request.idempotencyKey!, requestHash, claimOwnerId!);
+          }
+        } catch {
+          // Retain the request claim when tombstone verification itself is
+          // unavailable; lease recovery remains the ambiguity boundary.
+        }
+        const persistenceFailure = createHermesBridgeResult({
+          ok: false,
+          request,
+          mode: result.mode,
+          status: "failed",
+          summary: "Hermes bridge could not persist the idempotent result.",
+          error: {
+            type: "idempotency_persistence_failed",
+            message:
+              error instanceof Error
+                ? error.message
+                : "Hermes bridge could not persist the idempotent result.",
+          },
+        });
+        resolveFinalized?.({
+          result: persistenceFailure,
+          statusCode: 503,
+        });
+      }
+    })();
+    try {
+      const response = await finalized;
+      writeJson(res, response.statusCode, response.result);
+      return true;
+    } finally {
+      const current = inFlightRequests.get(request.idempotencyKey);
+      if (current?.finalized === finalized) {
+        inFlightRequests.delete(request.idempotencyKey);
+      }
+    }
   };
 }

@@ -3,6 +3,8 @@
  *
  * Loads references, resolves providers/options, saves generated images, and supports detached background runs.
  */
+import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { Type } from "typebox";
 import { getRuntimeConfig } from "../../config/config.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -135,6 +137,31 @@ const SUPPORTED_ASPECT_RATIOS = new Set([
 ]);
 
 const log = createSubsystemLogger("agents/tools/image-generate");
+
+const AI_DISCLOSURE_LABEL = "AI-ASSISTED VISUAL";
+const PAGE_HERO_DISCLOSURE_LABEL = "AI-assisted visual";
+const AI_DISCLOSURE_FONT: Record<string, string[]> = {
+  " ": ["00000", "00000", "00000", "00000", "00000", "00000", "00000"],
+  "-": ["00000", "00000", "00000", "11110", "00000", "00000", "00000"],
+  A: ["01110", "10001", "10001", "11111", "10001", "10001", "10001"],
+  D: ["11110", "10001", "10001", "10001", "10001", "10001", "11110"],
+  E: ["11111", "10000", "10000", "11110", "10000", "10000", "11111"],
+  I: ["11111", "00100", "00100", "00100", "00100", "00100", "11111"],
+  L: ["10000", "10000", "10000", "10000", "10000", "10000", "11111"],
+  S: ["01111", "10000", "10000", "01110", "00001", "00001", "11110"],
+  T: ["11111", "00100", "00100", "00100", "00100", "00100", "00100"],
+  U: ["10001", "10001", "10001", "10001", "10001", "10001", "01110"],
+  V: ["10001", "10001", "10001", "10001", "01010", "01010", "00100"],
+  a: ["00000", "00000", "01110", "00001", "01111", "10001", "01111"],
+  d: ["00001", "00001", "01101", "10011", "10001", "10001", "01111"],
+  e: ["00000", "00000", "01110", "10001", "11111", "10000", "01111"],
+  i: ["00100", "00000", "01100", "00100", "00100", "00100", "01110"],
+  l: ["01100", "00100", "00100", "00100", "00100", "00100", "01110"],
+  s: ["00000", "00000", "01111", "10000", "01110", "00001", "11110"],
+  t: ["00100", "00100", "11111", "00100", "00100", "00101", "00010"],
+  u: ["00000", "00000", "10001", "10001", "10001", "10011", "01101"],
+  v: ["00000", "00000", "10001", "10001", "10001", "01010", "00100"],
+};
 
 const ImageGenerateToolSchema = Type.Object({
   action: Type.Optional(
@@ -680,6 +707,387 @@ type ExecutedImageGeneration = {
   wakeResult: string;
 };
 
+type PngImage = {
+  width: number;
+  height: number;
+  data: Buffer;
+};
+
+type PngConstructor = {
+  new (params: { width: number; height: number }): PngImage;
+  sync: {
+    read: (buffer: Buffer) => PngImage;
+    write: (image: PngImage) => Buffer;
+  };
+  bitblt: (
+    source: PngImage,
+    destination: PngImage,
+    srcX: number,
+    srcY: number,
+    width: number,
+    height: number,
+    deltaX: number,
+    deltaY: number,
+  ) => void;
+};
+
+const require = createRequire(import.meta.url);
+const PNG = (require("pngjs") as { PNG: PngConstructor }).PNG;
+const MAX_ASPECT_RATIO_CANONICALIZATION_CROP_FRACTION = 0.03;
+
+function parseAspectRatioPair(value?: string): { width: number; height: number } | null {
+  const match = String(value ?? "")
+    .trim()
+    .match(/^([1-9][0-9]*)\s*:\s*([1-9][0-9]*)$/);
+  if (!match) {
+    return null;
+  }
+  return { width: Number(match[1]), height: Number(match[2]) };
+}
+
+function exactAspectRatioCropBox(params: {
+  width: number;
+  height: number;
+  ratioWidth: number;
+  ratioHeight: number;
+}): { x: number; y: number; width: number; height: number } | null {
+  if (params.width * params.ratioHeight === params.height * params.ratioWidth) {
+    return null;
+  }
+  const widthFirst = Math.floor(params.width / params.ratioWidth) * params.ratioWidth;
+  const widthFirstHeight = (widthFirst / params.ratioWidth) * params.ratioHeight;
+  const heightFirst = Math.floor(params.height / params.ratioHeight) * params.ratioHeight;
+  const heightFirstWidth = (heightFirst / params.ratioHeight) * params.ratioWidth;
+  const candidates = [
+    { width: widthFirst, height: widthFirstHeight },
+    { width: heightFirstWidth, height: heightFirst },
+  ].filter(
+    (candidate) =>
+      Number.isInteger(candidate.width) &&
+      Number.isInteger(candidate.height) &&
+      candidate.width > 0 &&
+      candidate.height > 0 &&
+      candidate.width <= params.width &&
+      candidate.height <= params.height,
+  );
+  const best = candidates.toSorted((a, b) => b.width * b.height - a.width * a.height)[0];
+  if (!best) {
+    return null;
+  }
+  const removedPixels = params.width * params.height - best.width * best.height;
+  const cropFraction = removedPixels / (params.width * params.height);
+  if (cropFraction > MAX_ASPECT_RATIO_CANONICALIZATION_CROP_FRACTION) {
+    return null;
+  }
+  return {
+    x: Math.floor((params.width - best.width) / 2),
+    y: Math.floor((params.height - best.height) / 2),
+    width: best.width,
+    height: best.height,
+  };
+}
+
+function exactAspectRatioPaddedSize(params: {
+  width: number;
+  height: number;
+  ratioWidth: number;
+  ratioHeight: number;
+}): { width: number; height: number } | null {
+  if (params.width * params.ratioHeight === params.height * params.ratioWidth) {
+    return null;
+  }
+  if (params.width * params.ratioHeight < params.height * params.ratioWidth) {
+    const targetHeight = Math.floor(params.height / params.ratioHeight) * params.ratioHeight;
+    const targetWidth = (targetHeight / params.ratioHeight) * params.ratioWidth;
+    if (targetWidth >= params.width && targetHeight >= params.height) {
+      return { width: targetWidth, height: targetHeight };
+    }
+    const fallbackHeight = Math.ceil(params.height / params.ratioHeight) * params.ratioHeight;
+    return {
+      width: (fallbackHeight / params.ratioHeight) * params.ratioWidth,
+      height: fallbackHeight,
+    };
+  }
+  const targetWidth = Math.floor(params.width / params.ratioWidth) * params.ratioWidth;
+  const targetHeight = (targetWidth / params.ratioWidth) * params.ratioHeight;
+  if (targetWidth >= params.width && targetHeight >= params.height) {
+    return { width: targetWidth, height: targetHeight };
+  }
+  const fallbackWidth = Math.ceil(params.width / params.ratioWidth) * params.ratioWidth;
+  return {
+    width: fallbackWidth,
+    height: (fallbackWidth / params.ratioWidth) * params.ratioHeight,
+  };
+}
+
+function padPngToAspectRatio(params: { png: PngImage; ratioWidth: number; ratioHeight: number }): {
+  png: PngImage;
+  padded: boolean;
+} {
+  const size = exactAspectRatioPaddedSize({
+    width: params.png.width,
+    height: params.png.height,
+    ratioWidth: params.ratioWidth,
+    ratioHeight: params.ratioHeight,
+  });
+  if (!size) {
+    return { png: params.png, padded: false };
+  }
+  const out = new PNG({ width: size.width, height: size.height });
+  for (let offset = 0; offset < out.data.length; offset += 4) {
+    out.data[offset] = 255;
+    out.data[offset + 1] = 248;
+    out.data[offset + 2] = 234;
+    out.data[offset + 3] = 255;
+  }
+  PNG.bitblt(
+    params.png,
+    out,
+    0,
+    0,
+    params.png.width,
+    params.png.height,
+    Math.floor((size.width - params.png.width) / 2),
+    Math.floor((size.height - params.png.height) / 2),
+  );
+  return { png: out, padded: true };
+}
+
+async function canonicalizeGeneratedImageAspectRatio(params: {
+  buffer: Buffer;
+  mimeType: string;
+  aspectRatio?: string;
+}): Promise<{
+  buffer: Buffer;
+  canonicalized: boolean;
+  dimensions?: string;
+}> {
+  const ratio = parseAspectRatioPair(params.aspectRatio);
+  if (!ratio || params.mimeType !== "image/png") {
+    return { buffer: params.buffer, canonicalized: false };
+  }
+  try {
+    const png = PNG.sync.read(params.buffer);
+    const crop = exactAspectRatioCropBox({
+      width: png.width,
+      height: png.height,
+      ratioWidth: ratio.width,
+      ratioHeight: ratio.height,
+    });
+    if (!crop) {
+      const padded = padPngToAspectRatio({
+        png,
+        ratioWidth: ratio.width,
+        ratioHeight: ratio.height,
+      });
+      if (!padded.padded) {
+        return { buffer: params.buffer, canonicalized: false };
+      }
+      return {
+        buffer: PNG.sync.write(padded.png),
+        canonicalized: true,
+        dimensions: `${padded.png.width}x${padded.png.height}`,
+      };
+    }
+    const out = new PNG({ width: crop.width, height: crop.height });
+    PNG.bitblt(png, out, crop.x, crop.y, crop.width, crop.height, 0, 0);
+    return {
+      buffer: PNG.sync.write(out),
+      canonicalized: true,
+      dimensions: `${crop.width}x${crop.height}`,
+    };
+  } catch {
+    return { buffer: params.buffer, canonicalized: false };
+  }
+}
+
+type AiDisclosureStyle = "audio-brief" | "page-hero";
+
+function isPageHeroAsset(params: { filename?: string; prompt: string }): boolean {
+  const filename = params.filename?.toLowerCase() ?? "";
+  const prompt = params.prompt.toLowerCase();
+  return (
+    filename.includes("page_hero") ||
+    filename.includes("page-hero") ||
+    prompt.includes("asset_family: page_hero") ||
+    prompt.includes("asset_family=page_hero")
+  );
+}
+
+function sanitizePageHeroGenerationPrompt(params: { filename?: string; prompt: string }): string {
+  if (!isPageHeroAsset(params)) {
+    return params.prompt;
+  }
+  return params.prompt
+    .replace(/AI[-\s]*assisted\s+visual/gi, "")
+    .replace(/AI[-\s]*generated(?:\s+visual)?/gi, "")
+    .replace(/AI\s+disclosure/gi, "")
+    .replace(/AI\s*揭露/gi, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function resolveAiDisclosureStyle(params: {
+  filename?: string;
+  prompt: string;
+}): AiDisclosureStyle | undefined {
+  const filename = params.filename?.toLowerCase() ?? "";
+  const prompt = params.prompt.toLowerCase();
+  const haystack = `${filename}\n${prompt}`;
+  if (isPageHeroAsset(params)) {
+    return "page-hero";
+  }
+  const isAudioBrief =
+    prompt.includes("asset_family: audio_brief") ||
+    prompt.includes("asset_family=audio_brief") ||
+    filename.includes("audio_brief") ||
+    filename.includes("audio-brief");
+  const hasDisclosureIntent =
+    haystack.includes("ai-assisted visual") ||
+    haystack.includes("ai-generated") ||
+    haystack.includes("ai disclosure") ||
+    haystack.includes("揭露");
+  const isAiBizWeek = haystack.includes("ai bizweek") || haystack.includes("aibizweek");
+  return isAudioBrief && (hasDisclosureIntent || isAiBizWeek) ? "audio-brief" : undefined;
+}
+
+function blendPixel(
+  png: PNG,
+  x: number,
+  y: number,
+  color: { r: number; g: number; b: number; a: number },
+) {
+  if (x < 0 || y < 0 || x >= png.width || y >= png.height) {
+    return;
+  }
+  const idx = (png.width * y + x) << 2;
+  const alpha = Math.max(0, Math.min(1, color.a));
+  png.data[idx] = Math.round(png.data[idx] * (1 - alpha) + color.r * alpha);
+  png.data[idx + 1] = Math.round(png.data[idx + 1] * (1 - alpha) + color.g * alpha);
+  png.data[idx + 2] = Math.round(png.data[idx + 2] * (1 - alpha) + color.b * alpha);
+  png.data[idx + 3] = 255;
+}
+
+function fillRect(
+  png: PNG,
+  rect: { x: number; y: number; width: number; height: number },
+  color: { r: number; g: number; b: number; a: number },
+) {
+  for (let y = rect.y; y < rect.y + rect.height; y += 1) {
+    for (let x = rect.x; x < rect.x + rect.width; x += 1) {
+      blendPixel(png, x, y, color);
+    }
+  }
+}
+
+function drawBitmapText(
+  png: PNG,
+  text: string,
+  origin: { x: number; y: number },
+  scale: number,
+  color: { r: number; g: number; b: number; a: number },
+) {
+  let cursorX = origin.x;
+  for (const char of text) {
+    const glyph = AI_DISCLOSURE_FONT[char] ?? AI_DISCLOSURE_FONT[" "];
+    for (const [row, bits] of glyph.entries()) {
+      for (let col = 0; col < bits.length; col += 1) {
+        if (bits[col] !== "1") {
+          continue;
+        }
+        fillRect(
+          png,
+          {
+            x: cursorX + col * scale,
+            y: origin.y + row * scale,
+            width: scale,
+            height: scale,
+          },
+          color,
+        );
+      }
+    }
+    cursorX += 6 * scale;
+  }
+}
+
+function overlayAiDisclosure(params: {
+  buffer: Buffer;
+  mimeType: string;
+  style?: AiDisclosureStyle;
+}): { buffer: Buffer; applied: true } | { buffer: Buffer; applied: false } {
+  if (!params.style || params.mimeType !== "image/png") {
+    return { buffer: params.buffer, applied: false };
+  }
+  try {
+    const png = PNG.sync.read(params.buffer);
+    const compact = params.style === "page-hero";
+    const label = compact ? PAGE_HERO_DISCLOSURE_LABEL : AI_DISCLOSURE_LABEL;
+    const scale = compact
+      ? Math.max(2, Math.round(png.width / 1000))
+      : Math.max(2, Math.round(png.width / 420));
+    const textWidth = label.length * 6 * scale - scale;
+    const textHeight = 7 * scale;
+    const padX = compact ? 4 : Math.round(scale * 4);
+    const padY = compact ? 3 : Math.round(scale * 3);
+    const boxWidth = textWidth + padX * 2;
+    const boxHeight = textHeight + padY * 2;
+    const margin = compact ? 8 : Math.round(scale * 8);
+    const bottomProgramStripReserve = compact ? 0 : Math.round(png.height * 0.11);
+    const x = compact ? margin : Math.max(margin, png.width - boxWidth - margin);
+    const y = Math.max(margin, png.height - bottomProgramStripReserve - boxHeight - margin);
+    fillRect(
+      png,
+      { x, y, width: boxWidth, height: boxHeight },
+      compact ? { r: 255, g: 248, b: 234, a: 0.72 } : { r: 0, g: 23, b: 43, a: 0.82 },
+    );
+    if (!compact) {
+      fillRect(png, { x, y, width: boxWidth, height: scale }, { r: 242, g: 182, b: 43, a: 0.95 });
+      fillRect(
+        png,
+        { x, y: y + boxHeight - scale, width: boxWidth, height: scale },
+        { r: 242, g: 182, b: 43, a: 0.95 },
+      );
+      fillRect(png, { x, y, width: scale, height: boxHeight }, { r: 242, g: 182, b: 43, a: 0.95 });
+      fillRect(
+        png,
+        { x: x + boxWidth - scale, y, width: scale, height: boxHeight },
+        { r: 242, g: 182, b: 43, a: 0.95 },
+      );
+    }
+    drawBitmapText(
+      png,
+      label,
+      { x: x + padX, y: y + padY },
+      scale,
+      compact ? { r: 48, g: 48, b: 48, a: 0.82 } : { r: 255, g: 255, b: 255, a: 1 },
+    );
+    return { buffer: PNG.sync.write(png), applied: true };
+  } catch {
+    return { buffer: params.buffer, applied: false };
+  }
+}
+
+async function buildGeneratedImageMetadata(image: { buffer: Buffer }): Promise<{
+  width?: number;
+  height?: number;
+  dimensions?: string;
+  sha256: string;
+}> {
+  const sha256 = createHash("sha256").update(image.buffer).digest("hex");
+  try {
+    const metadata = await getImageMetadata(image.buffer);
+    const width = metadata?.width;
+    const height = metadata?.height;
+    if (typeof width === "number" && typeof height === "number" && width > 0 && height > 0) {
+      return { width, height, dimensions: `${width}x${height}`, sha256 };
+    }
+  } catch {
+    // Keep the generated file usable even when the probe backend cannot decode it.
+  }
+  return { sha256 };
+}
+
 const defaultScheduleImageGenerateBackgroundWork = createDefaultMediaGenerateBackgroundScheduler({
   toolName: "image_generate",
   onCrash: (message, meta) => log.error(message, meta),
@@ -714,7 +1122,10 @@ async function executeImageGenerationJob(params: {
   }
   const result = await generateImage({
     cfg: params.effectiveCfg,
-    prompt: params.prompt,
+    prompt: sanitizePageHeroGenerationPrompt({
+      filename: params.filename,
+      prompt: params.prompt,
+    }),
     agentDir: params.agentDir,
     modelOverride: params.model,
     autoProviderFallback: params.autoProviderFallback,
@@ -768,16 +1179,43 @@ async function executeImageGenerationJob(params: {
       Boolean(normalizedAspectRatio));
 
   const mediaMaxBytes = resolveGeneratedMediaMaxBytes(params.effectiveCfg, "image");
+  const aiDisclosureStyle = resolveAiDisclosureStyle({
+    filename: params.filename,
+    prompt: params.prompt,
+  });
+  const preparedImages = await Promise.all(
+    result.images.map(async (image) => {
+      const canonicalized = await canonicalizeGeneratedImageAspectRatio({
+        buffer: image.buffer,
+        mimeType: image.mimeType,
+        aspectRatio: normalizedAspectRatio ?? params.aspectRatio,
+      });
+      const disclosure = overlayAiDisclosure({
+        buffer: canonicalized.buffer,
+        mimeType: image.mimeType,
+        style: aiDisclosureStyle,
+      });
+      return {
+        ...image,
+        ...canonicalized,
+        buffer: disclosure.buffer,
+        aiDisclosureOverlayApplied: disclosure.applied,
+      };
+    }),
+  );
   const savedImages = await Promise.all(
-    result.images.map((image) =>
-      saveMediaBuffer(
+    preparedImages.map(async (image) => ({
+      saved: await saveMediaBuffer(
         image.buffer,
         image.mimeType,
         "tool-image-generation",
         mediaMaxBytes,
         params.filename || image.fileName,
       ),
-    ),
+      metadata: await buildGeneratedImageMetadata(image),
+      canonicalized: image.canonicalized,
+      aiDisclosureOverlayApplied: image.aiDisclosureOverlayApplied,
+    })),
   );
 
   const revisedPrompts = result.images
@@ -785,21 +1223,28 @@ async function executeImageGenerationJob(params: {
     .filter((entry): entry is string => Boolean(entry));
   const attachments = savedImages.map((image) => ({
     type: "image" as const,
-    path: image.path,
-    mimeType: image.contentType,
-    name: image.id,
+    path: image.saved.path,
+    mimeType: image.saved.contentType,
+    name: image.saved.id,
+    ...image.metadata,
   }));
   const lines = [
     `Generated ${savedImages.length} image${savedImages.length === 1 ? "" : "s"} with ${displayProvider}/${displayModel}.`,
     ...(warning ? [`Warning: ${warning}`] : []),
+    ...(savedImages.some((image) => image.canonicalized)
+      ? ["Normalized generated image crop to requested exact aspect ratio."]
+      : []),
+    ...(savedImages.some((image) => image.aiDisclosureOverlayApplied)
+      ? ["Applied deterministic AI-assisted visual disclosure overlay."]
+      : []),
     ...formatGeneratedAttachmentLines(attachments),
   ];
   return {
     provider: result.provider,
     model: result.model,
-    savedPaths: savedImages.map((image) => image.path),
+    savedPaths: savedImages.map((image) => image.saved.path),
     count: savedImages.length,
-    paths: savedImages.map((image) => image.path),
+    paths: savedImages.map((image) => image.saved.path),
     attachments,
     contentText: lines.join("\n"),
     wakeResult: lines.join("\n"),
@@ -808,11 +1253,17 @@ async function executeImageGenerationJob(params: {
       model: result.model,
       count: savedImages.length,
       media: {
-        mediaUrls: savedImages.map((image) => image.path),
+        mediaUrls: savedImages.map((image) => image.saved.path),
         attachments,
       },
       attachments,
-      paths: savedImages.map((image) => image.path),
+      paths: savedImages.map((image) => image.saved.path),
+      ...(savedImages.some((image) => image.canonicalized)
+        ? { aspectRatioCanonicalized: true }
+        : {}),
+      ...(savedImages.some((image) => image.aiDisclosureOverlayApplied)
+        ? { aiDisclosureOverlayApplied: true }
+        : {}),
       ...buildTaskRunDetails(params.taskHandle),
       ...buildMediaReferenceDetails({
         entries: params.loadedReferenceImages,

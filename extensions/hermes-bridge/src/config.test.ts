@@ -27,6 +27,34 @@ describe("resolveHermesBridgeConfig", () => {
       allowedTasks: ["status.echo", "message.preview"],
       allowedTools: ["telegram.send", "shell"],
       maxRequestBytes: 128,
+      idempotencyDbPath: "~/.openclaw/hermes-bridge-idempotency.sqlite",
+      readonlyBrowserAgentId: "missioncrew-browser-readonly",
+      maxLiveRuntimeSeconds: 120,
     });
+  });
+
+  it("falls back from fractional limits and non-fixed reviewer identities", () => {
+    expect(
+      resolveHermesBridgeConfig({
+        maxRequestBytes: 0.5,
+        maxLiveRuntimeSeconds: 0.5,
+        readonlyBrowserAgentId: "unexpected-agent",
+      }),
+    ).toMatchObject({
+      maxRequestBytes: 262_144,
+      maxLiveRuntimeSeconds: 120,
+      readonlyBrowserAgentId: "missioncrew-browser-readonly",
+    });
+  });
+
+  it("rejects live runtime values that can overflow timer or lease arithmetic", () => {
+    expect(
+      resolveHermesBridgeConfig({
+        maxLiveRuntimeSeconds: Number.MAX_SAFE_INTEGER,
+      }).maxLiveRuntimeSeconds,
+    ).toBe(120);
+    expect(resolveHermesBridgeConfig({ maxLiveRuntimeSeconds: 3_600 }).maxLiveRuntimeSeconds).toBe(
+      3_600,
+    );
   });
 });

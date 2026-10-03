@@ -78,50 +78,28 @@ export async function captureScreenshot(opts: {
     async (send) => {
       await send("Page.enable");
 
-      // For full-page captures, temporarily expand the viewport to the content
-      // size so the entire page is within the viewport bounds.  We save the
-      // current viewport state and restore it after capture so pre-existing
-      // device emulation (mobile width, DPR, touch) is not lost.
-      let savedVp: { w: number; h: number; dpr: number; sw: number; sh: number } | undefined;
+      // A temporary CDP socket must not replace another client's emulation.
+      // Capture the content rectangle without changing viewport, DPR or mobile state.
+      let clip: { x: number; y: number; width: number; height: number; scale: number } | undefined;
       if (opts.fullPage) {
         const metrics = (await send("Page.getLayoutMetrics")) as {
           cssContentSize?: { width?: number; height?: number };
           contentSize?: { width?: number; height?: number };
+          cssLayoutViewport?: { clientWidth?: number; clientHeight?: number };
+          layoutViewport?: { clientWidth?: number; clientHeight?: number };
         };
         const size = metrics?.cssContentSize ?? metrics?.contentSize;
+        const viewport = metrics?.cssLayoutViewport ?? metrics?.layoutViewport;
         const contentWidth = size?.width ?? 0;
         const contentHeight = size?.height ?? 0;
         if (contentWidth > 0 && contentHeight > 0) {
-          const vpResult = (await send("Runtime.evaluate", {
-            expression:
-              "({ w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio, sw: screen.width, sh: screen.height })",
-            returnByValue: true,
-          })) as {
-            result?: {
-              value?: { w?: number; h?: number; dpr?: number; sw?: number; sh?: number };
-            };
+          clip = {
+            x: 0,
+            y: 0,
+            width: Math.ceil(Math.max(contentWidth, viewport?.clientWidth ?? 0)),
+            height: Math.ceil(Math.max(contentHeight, viewport?.clientHeight ?? 0)),
+            scale: 1,
           };
-          const v = vpResult?.result?.value;
-          const currentW = v?.w ?? 0;
-          const currentH = v?.h ?? 0;
-          savedVp = {
-            w: currentW,
-            h: currentH,
-            dpr: v?.dpr ?? 1,
-            sw: v?.sw ?? currentW,
-            sh: v?.sh ?? currentH,
-          };
-          // mobile: false is the safe default — CDP provides no way to query
-          // the active mobile flag, and inferring from navigator.maxTouchPoints
-          // would false-positive on touch-enabled desktops.
-          await send("Emulation.setDeviceMetricsOverride", {
-            width: Math.ceil(Math.max(currentW, contentWidth)),
-            height: Math.ceil(Math.max(currentH, contentHeight)),
-            deviceScaleFactor: savedVp.dpr,
-            mobile: false,
-            screenWidth: savedVp.sw,
-            screenHeight: savedVp.sh,
-          });
         }
       }
 
@@ -129,50 +107,18 @@ export async function captureScreenshot(opts: {
       const quality =
         format === "jpeg" ? Math.max(0, Math.min(100, Math.round(opts.quality ?? 85))) : undefined;
 
-      try {
-        // Chrome 146+ managed/headful browsers reject fromSurface: false.
-        // For ordinary viewport captures, keep CDP's captureBeyondViewport
-        // default (false), matching Playwright's Chromium path.
-        const result = (await send("Page.captureScreenshot", {
-          format,
-          ...(quality !== undefined ? { quality } : {}),
-          ...(opts.fullPage ? { captureBeyondViewport: true } : {}),
-        })) as { data?: string };
+      // Chrome 146+ rejects fromSurface: false. Ordinary captures retain CDP defaults.
+      const result = (await send("Page.captureScreenshot", {
+        format,
+        ...(quality !== undefined ? { quality } : {}),
+        ...(opts.fullPage ? { captureBeyondViewport: true, ...(clip ? { clip } : {}) } : {}),
+      })) as { data?: string };
 
-        const base64 = result?.data;
-        if (!base64) {
-          throw new Error("Screenshot failed: missing data");
-        }
-        return Buffer.from(base64, "base64");
-      } finally {
-        if (savedVp) {
-          // Clear the temporary viewport expansion first.  If the tab had
-          // prior device emulation the clear will change the viewport back to
-          // the browser's natural dimensions — detect that and re-apply the
-          // saved emulation so the tab's original state is preserved.
-          await send("Emulation.clearDeviceMetricsOverride").catch(() => {});
-          try {
-            const postResult = (await send("Runtime.evaluate", {
-              expression:
-                "({ w: window.innerWidth, h: window.innerHeight, dpr: window.devicePixelRatio })",
-              returnByValue: true,
-            })) as { result?: { value?: { w?: number; h?: number; dpr?: number } } };
-            const p = postResult?.result?.value;
-            if (p?.w !== savedVp.w || p?.h !== savedVp.h || p?.dpr !== savedVp.dpr) {
-              await send("Emulation.setDeviceMetricsOverride", {
-                width: savedVp.w,
-                height: savedVp.h,
-                deviceScaleFactor: savedVp.dpr,
-                mobile: false,
-                screenWidth: savedVp.sw,
-                screenHeight: savedVp.sh,
-              });
-            }
-          } catch {
-            // Best-effort restoration; ignore failures in the cleanup path.
-          }
-        }
+      const base64 = result?.data;
+      if (!base64) {
+        throw new Error("Screenshot failed: missing data");
       }
+      return Buffer.from(base64, "base64");
     },
     { commandTimeoutMs: opts.timeoutMs },
   );

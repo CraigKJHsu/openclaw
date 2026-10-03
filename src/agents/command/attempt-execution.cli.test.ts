@@ -1923,6 +1923,7 @@ describe("CLI attempt execution", () => {
       runId: "run-cli-tools-allow",
       opts: {
         toolsAllow: ["read", "web_search"],
+        disableTools: true,
       } as Parameters<typeof runAgentAttempt>[0]["opts"],
       runContext: {} as Parameters<typeof runAgentAttempt>[0]["runContext"],
       spawnedBy: undefined,
@@ -1940,6 +1941,7 @@ describe("CLI attempt execution", () => {
     expectMockArgFields(runCliAgentMock, {
       provider: "claude-cli",
       toolsAllow: ["read", "web_search"],
+      disableTools: true,
     });
   });
 
@@ -2649,6 +2651,7 @@ describe("embedded attempt harness pinning", () => {
       runId: "run-tools-allow",
       opts: {
         toolsAllow: ["read", "web_search"],
+        disableTools: true,
       } as Parameters<typeof runAgentAttempt>[0]["opts"],
       runContext: {} as Parameters<typeof runAgentAttempt>[0]["runContext"],
       spawnedBy: undefined,
@@ -2661,7 +2664,10 @@ describe("embedded attempt harness pinning", () => {
       sessionHasHistory: false,
     });
 
-    expectMockArgFields(runEmbeddedAgentMock, { toolsAllow: ["read", "web_search"] });
+    expectMockArgFields(runEmbeddedAgentMock, {
+      toolsAllow: ["read", "web_search"],
+      disableTools: true,
+    });
   });
 
   it("lets provider/model runtime policy choose Codex without storing a session harness pin", async () => {

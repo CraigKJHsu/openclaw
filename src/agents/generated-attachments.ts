@@ -15,6 +15,10 @@ export type AgentGeneratedAttachment = {
   filePath?: string;
   mimeType?: string;
   name?: string;
+  width?: number;
+  height?: number;
+  dimensions?: string;
+  sha256?: string;
 };
 
 function generatedAttachmentReference(attachment: AgentGeneratedAttachment): string | undefined {
@@ -62,6 +66,14 @@ export function formatGeneratedAttachmentLines(
     }
     if (mimeType) {
       parts.push(`mimeType=${mimeType}`);
+    }
+    if (typeof attachment.width === "number" && typeof attachment.height === "number") {
+      parts.push(`dimensions=${attachment.width}x${attachment.height}`);
+    } else if (attachment.dimensions) {
+      parts.push(`dimensions=${attachment.dimensions}`);
+    }
+    if (attachment.sha256) {
+      parts.push(`sha256=${attachment.sha256}`);
     }
     if (path) {
       parts.push(`path=${JSON.stringify(path)}`);

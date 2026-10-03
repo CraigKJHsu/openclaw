@@ -30,6 +30,7 @@ import {
   isDeliverableMessageChannel,
 } from "../../utils/message-channel.js";
 import {
+  formatGeneratedAttachmentLines,
   mediaUrlsFromGeneratedAttachments,
   type AgentGeneratedAttachment,
 } from "../generated-attachments.js";
@@ -116,6 +117,7 @@ type CompleteMediaGenerationTaskRunParams = {
   model: string;
   count: number;
   paths: string[];
+  attachments?: AgentGeneratedAttachment[];
   terminalResult?: RequiredCompletionTerminalResult;
 };
 
@@ -263,6 +265,7 @@ function completeMediaGenerationTaskRun(params: {
   model: string;
   count: number;
   paths: string[];
+  attachments?: AgentGeneratedAttachment[];
   generatedLabel: string;
   terminalResult?: RequiredCompletionTerminalResult;
 }) {
@@ -272,6 +275,7 @@ function completeMediaGenerationTaskRun(params: {
   try {
     const endedAt = Date.now();
     const target = params.count === 1 ? params.paths[0] : `${params.count} files`;
+    const attachmentSummary = formatGeneratedAttachmentLines(params.attachments).join(" ");
     completeTaskRunByRunId({
       runId: params.handle.runId,
       runtime: "cli",
@@ -281,7 +285,12 @@ function completeMediaGenerationTaskRun(params: {
       progressSummary: `Generated ${params.count} ${params.generatedLabel}${params.count === 1 ? "" : "s"}`,
       terminalSummary:
         params.terminalResult?.terminalSummary ??
-        `Generated ${params.count} ${params.generatedLabel}${params.count === 1 ? "" : "s"} with ${params.provider}/${params.model}${target ? ` -> ${target}` : ""}.`,
+        [
+          `Generated ${params.count} ${params.generatedLabel}${params.count === 1 ? "" : "s"} with ${params.provider}/${params.model}${target ? ` -> ${target}` : ""}.`,
+          attachmentSummary,
+        ]
+          .filter((entry) => Boolean(entry))
+          .join(" "),
       terminalOutcome: params.terminalResult?.terminalOutcome,
     });
   } finally {
@@ -521,6 +530,7 @@ export function scheduleMediaGenerationTaskCompletion<
         model: executed.model,
         count: executed.count,
         paths: executed.paths,
+        attachments: executed.attachments,
         terminalResult,
       });
     } catch (error) {

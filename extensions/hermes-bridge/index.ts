@@ -1,6 +1,14 @@
 import { definePluginEntry } from "openclaw/plugin-sdk/plugin-entry";
 import { resolveHermesBridgeConfig } from "./src/config.js";
+import {
+  createDeterministicImageRenderTool,
+  DETERMINISTIC_IMAGE_RENDER_TOOL,
+} from "./src/deterministic-image-render-capability.js";
+import { createFacebookPageCapabilityTools } from "./src/facebook-page-capability.js";
 import { createHermesBridgeHttpHandler } from "./src/http-route.js";
+import { SqliteHermesBridgeIdempotencyStore } from "./src/idempotency-store.js";
+import { createResultTool, RESULT_TOOL } from "./src/result-tool.js";
+import { sweepHermesBridgeCleanupObligations } from "./src/task-registry.js";
 import { createHermesBridgeTool } from "./src/tool.js";
 
 export default definePluginEntry({
@@ -9,14 +17,80 @@ export default definePluginEntry({
   description: "Local delegation bridge from Hermes Agent to OpenClaw task templates.",
   register(api) {
     const resolveConfig = () => resolveHermesBridgeConfig(api.pluginConfig);
+    let idempotencyStore: SqliteHermesBridgeIdempotencyStore | undefined;
+    let cleanupTimer: ReturnType<typeof setInterval> | undefined;
+    let startupTimer: ReturnType<typeof setTimeout> | undefined;
+    let cleanupRunning = false;
+    const runCleanupSweep = async () => {
+      if (!idempotencyStore || cleanupRunning) {
+        return;
+      }
+      cleanupRunning = true;
+      try {
+        await sweepHermesBridgeCleanupObligations({
+          store: idempotencyStore,
+          subagent: api.runtime.subagent,
+          config: resolveConfig(),
+        });
+      } finally {
+        cleanupRunning = false;
+      }
+    };
+    const resolveIdempotencyStore = () => {
+      idempotencyStore ??= new SqliteHermesBridgeIdempotencyStore(
+        resolveConfig().idempotencyDbPath,
+      );
+      if (!cleanupTimer) {
+        cleanupTimer = setInterval(() => {
+          void runCleanupSweep().catch(() => undefined);
+        }, 30_000);
+        cleanupTimer.unref();
+        void runCleanupSweep().catch(() => undefined);
+      }
+      return idempotencyStore;
+    };
+    if (resolveConfig().enabled) {
+      startupTimer = setTimeout(() => {
+        try {
+          resolveIdempotencyStore();
+        } catch {
+          // Keep plugin registration alive. The first request returns the
+          // structured idempotency_store_unavailable result with details.
+        }
+      }, 0);
+      startupTimer.unref();
+    }
+    api.lifecycle.registerRuntimeLifecycle({
+      id: "hermes-bridge-idempotency",
+      description: "Close the Hermes bridge persistent idempotency database.",
+      cleanup: () => {
+        if (cleanupTimer) {
+          clearInterval(cleanupTimer);
+          cleanupTimer = undefined;
+        }
+        if (startupTimer) {
+          clearTimeout(startupTimer);
+          startupTimer = undefined;
+        }
+        // Runtime cleanup can precede reuse of this registered HTTP handler.
+        // Reopen the durable store on demand; never reuse a closed connection.
+        const store = idempotencyStore;
+        idempotencyStore = undefined;
+        store?.close();
+      },
+    });
 
     api.registerHttpRoute({
       path: "/api/plugins/hermes-bridge/tasks",
       auth: "gateway",
       match: "exact",
+      gatewayRuntimeScopeSurface: "trusted-operator",
       handler: createHermesBridgeHttpHandler({
         resolveConfig,
         env: process.env,
+        resolveIdempotencyStore,
+        subagent: api.runtime.subagent,
+        taskRuns: api.runtime.tasks?.runs,
       }),
     });
 
@@ -29,6 +103,26 @@ export default definePluginEntry({
         return createHermesBridgeTool({ config });
       },
       { name: "hermes_bridge", optional: true },
+    );
+    api.registerTool((ctx) => createFacebookPageCapabilityTools(ctx, resolveConfig()), {
+      names: [
+        "facebook_page_publish_preflight",
+        "facebook_page_graph_status",
+        "facebook_page_graph_publish",
+      ],
+      optional: true,
+    });
+    api.registerTool(
+      (ctx) =>
+        createDeterministicImageRenderTool(ctx, resolveConfig(), api.runtime.tasks?.runs),
+      { name: DETERMINISTIC_IMAGE_RENDER_TOOL, optional: true },
+    );
+    api.registerTool(
+      (ctx) =>
+        resolveConfig().enabled && ctx.sessionKey?.includes(":subagent:hermes-loop-")
+          ? createResultTool(ctx.sessionKey)
+          : null,
+      { name: RESULT_TOOL, optional: true },
     );
   },
 });
